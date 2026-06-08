@@ -51,6 +51,13 @@ def _page_of(episode_no: int) -> int:
     return (episode_no - 1) // PER_PAGE
 
 
+def _done_episodes(tpl: dict, filled: set[int]) -> set[int]:
+    """Серії, що вважаються готовими: реальні релізи ∪ перші manual_done
+    (їх адмін викладає вручну поза ботом)."""
+    manual = min(int(tpl.get("manual_done") or 0), tpl["episodes_count"])
+    return filled | set(range(1, manual + 1))
+
+
 class TplFSM(StatesGroup):
     name = State()
     count = State()
@@ -91,9 +98,9 @@ async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
     tpls = await list_templates()
     rows: list[list[InlineKeyboardButton]] = []
     for t in tpls:
-        filled = len(await filled_episodes(t["id"]))
+        done = len(_done_episodes(t, await filled_episodes(t["id"])))
         rows.append([InlineKeyboardButton(
-            text=texts.ANIME_BTN.format(name=t["name"], filled=filled, count=t["episodes_count"]),
+            text=texts.ANIME_BTN.format(name=t["name"], filled=done, count=t["episodes_count"]),
             callback_data=f"anime:{t['id']}",
         )])
     rows.append([InlineKeyboardButton(text=texts.BTN_NEW_ANIME, callback_data="anime_new")])
@@ -111,7 +118,7 @@ async def _template_view(
     total = tpl["episodes_count"]
     pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, pages - 1))
-    filled = await filled_episodes(template_id)
+    done = _done_episodes(tpl, await filled_episodes(template_id))
     wd = tpl["weekday"]
     start_date = date.fromisoformat(tpl["start_date"])
 
@@ -123,7 +130,7 @@ async def _template_view(
         count=total,
         weekday=texts.WEEKDAYS_FULL[wd],
         time=tpl["send_time"],
-        filled=len(filled),
+        filled=len(done),
     )
     d1 = start_date + timedelta(days=7 * (start_ep - 1))
     d2 = start_date + timedelta(days=7 * (end_ep - 1))
@@ -134,7 +141,7 @@ async def _template_view(
     # Слоти сторінки — компактні кнопки «✅/⬜ N», по PER_ROW у рядку.
     buttons = [
         InlineKeyboardButton(
-            text=texts.SLOT_BTN.format(mark="✅" if ep in filled else "⬜", n=ep),
+            text=texts.SLOT_BTN.format(mark="✅" if ep in done else "⬜", n=ep),
             callback_data=f"slot:{template_id}:{ep}",
         )
         for ep in range(start_ep, end_ep + 1)
@@ -482,7 +489,24 @@ async def cb_slot(callback: CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
+    # Серія з-поміж перших manual_done — викладається вручну поза ботом.
+    tpl = await get_template(tid)
+    if tpl and ep <= (tpl.get("manual_done") or 0):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=texts.BTN_FILL_VIA_BOT, callback_data=f"slotfill:{tid}:{ep}")],
+            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anpg:{tid}:{_page_of(ep)}")],
+        ])
+        await _edit_cb(callback, texts.SLOT_MANUAL.format(n=ep), kb)
+        await callback.answer()
+        return
     await _begin_slot_wizard(callback, state, tid, ep, old_release_id=None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("slotfill:"))
+async def cb_slot_fill(callback: CallbackQuery, state: FSMContext):
+    _, tid_s, ep_s = callback.data.split(":")
+    await _begin_slot_wizard(callback, state, int(tid_s), int(ep_s), old_release_id=None)
     await callback.answer()
 
 

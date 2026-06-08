@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS templates (
     send_time       TEXT NOT NULL,              -- 'HH:MM'
     episodes_count  INTEGER NOT NULL,
     start_date      TEXT NOT NULL,              -- 'YYYY-MM-DD' (дата серії 1)
+    manual_done     INTEGER NOT NULL DEFAULT 1, -- скільки перших серій уже викладено вручну
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -77,6 +78,13 @@ async def _migrate() -> None:
     ):
         if col not in cols:
             await _conn().execute(f"ALTER TABLE releases ADD COLUMN {col} {decl}")
+    # Колонка templates.manual_done для вже створених БД.
+    cur = await _conn().execute("PRAGMA table_info(templates)")
+    tcols = {row["name"] for row in await cur.fetchall()}
+    if "manual_done" not in tcols:
+        await _conn().execute(
+            "ALTER TABLE templates ADD COLUMN manual_done INTEGER NOT NULL DEFAULT 1"
+        )
     # Індекс по слоту створюємо тут — після того, як колонки гарантовано є
     # (на старій БД їх ще не було під час executescript).
     await _conn().execute(
@@ -107,13 +115,14 @@ async def create_template(
     send_time: str,
     episodes_count: int,
     start_date: str,
+    manual_done: int = 1,
 ) -> int:
     cur = await _conn().execute(
         """
-        INSERT INTO templates (name, weekday, send_time, episodes_count, start_date)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO templates (name, weekday, send_time, episodes_count, start_date, manual_done)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (name, weekday, send_time, episodes_count, start_date),
+        (name, weekday, send_time, episodes_count, start_date, manual_done),
     )
     await _conn().commit()
     return cur.lastrowid
@@ -122,7 +131,7 @@ async def create_template(
 async def list_templates() -> list[dict]:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done
         FROM templates
         ORDER BY created_at
         """,
@@ -133,7 +142,7 @@ async def list_templates() -> list[dict]:
 async def get_template(template_id: int) -> dict | None:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done
         FROM templates WHERE id = ?
         """,
         (template_id,),
