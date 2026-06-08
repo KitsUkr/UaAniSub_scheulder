@@ -29,18 +29,20 @@ def _msg_link(channel: str, message_id: int) -> str:
     return f"https://t.me/{channel.lstrip('@')}/{message_id}"
 
 
-async def _send_media(bot: Bot, file_id: str, kind: str):
+async def _send_media(bot: Bot, file_id: str, kind: str, caption: str | None = None):
     """Репост файлу за file_id (без завантаження/перезаливки — будь-який розмір).
     Метод відповідає способу отримання: video → відтворюється inline,
-    document → завантажується."""
+    document → завантажується. caption (HTML) кріпиться під медіа."""
     if kind == "video":
-        return await bot.send_video(RELEASE_CHANNEL, file_id, supports_streaming=True)
-    return await bot.send_document(RELEASE_CHANNEL, file_id)
+        return await bot.send_video(
+            RELEASE_CHANNEL, file_id, caption=caption, supports_streaming=True
+        )
+    return await bot.send_document(RELEASE_CHANNEL, file_id, caption=caption)
 
 
 async def _publish_one(bot: Bot, r: dict) -> None:
     # Послідовні await гарантують порядок: MP4 → MKV → превʼю.
-    mp4_msg = await _send_media(bot, r["mp4_file_id"], r["mp4_kind"])
+    mp4_msg = await _send_media(bot, r["mp4_file_id"], r["mp4_kind"], r.get("mp4_caption_html"))
     mkv_msg = await _send_media(bot, r["mkv_file_id"], r["mkv_kind"])
 
     watch = _msg_link(RELEASE_CHANNEL, mp4_msg.message_id)

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS releases (
     caption_html    TEXT,
     mp4_file_id     TEXT NOT NULL,
     mp4_kind        TEXT NOT NULL,
+    mp4_caption_html TEXT,
     mkv_file_id     TEXT NOT NULL,
     mkv_kind        TEXT NOT NULL,
     run_at          TEXT NOT NULL,
@@ -69,7 +70,11 @@ async def _migrate() -> None:
     """Доганяє схему для вже створених БД: додає нові колонки releases, якщо їх нема."""
     cur = await _conn().execute("PRAGMA table_info(releases)")
     cols = {row["name"] for row in await cur.fetchall()}
-    for col, decl in (("template_id", "INTEGER"), ("episode_no", "INTEGER")):
+    for col, decl in (
+        ("template_id", "INTEGER"),
+        ("episode_no", "INTEGER"),
+        ("mp4_caption_html", "TEXT"),
+    ):
         if col not in cols:
             await _conn().execute(f"ALTER TABLE releases ADD COLUMN {col} {decl}")
     # Індекс по слоту створюємо тут — після того, як колонки гарантовано є
@@ -160,6 +165,7 @@ async def create_release(
     mkv_file_id: str,
     mkv_kind: str,
     run_at: str,
+    mp4_caption_html: str | None = None,
     template_id: int | None = None,
     episode_no: int | None = None,
 ) -> int:
@@ -167,14 +173,14 @@ async def create_release(
         """
         INSERT INTO releases (
             preview_file_id, caption_html,
-            mp4_file_id, mp4_kind, mkv_file_id, mkv_kind, run_at,
+            mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at,
             template_id, episode_no
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             preview_file_id, caption_html,
-            mp4_file_id, mp4_kind, mkv_file_id, mkv_kind, run_at,
+            mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at,
             template_id, episode_no,
         ),
     )
@@ -214,7 +220,7 @@ async def due_releases(now_str: str) -> list[dict]:
     cur = await _conn().execute(
         """
         SELECT id, preview_file_id, caption_html,
-               mp4_file_id, mp4_kind, mkv_file_id, mkv_kind, run_at
+               mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at
         FROM releases
         WHERE status = 'pending' AND run_at <= ?
         ORDER BY run_at

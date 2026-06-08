@@ -516,9 +516,9 @@ async def slot_collect(message: Message, state: FSMContext):
     """Приймає превʼю/MP4/MKV у будь-якому порядку (зокрема альбомом),
     сам розкладає за типом. Коли всі три зібрані — зʼявляється «Запланувати»."""
     res = _classify(message)
-    caption_html = (
-        message.html_text if (res and res[0] == "preview" and message.caption) else None
-    )
+    # Підпис беремо з будь-якого вкладення, що має caption: превʼю → у пост превʼю,
+    # MP4 → у пост відео в release-каналі.
+    cap_html = message.html_text if (res and message.caption) else None
     await _delete(message)
     # Лок: альбом дає кілька паралельних update'ів — read-modify-write має бути атомарним.
     async with _files_lock:
@@ -530,9 +530,9 @@ async def slot_collect(message: Message, state: FSMContext):
             return
         role, fid, kind = res
         if role == "preview":
-            await state.update_data(preview_file_id=fid, caption_html=caption_html)
+            await state.update_data(preview_file_id=fid, caption_html=cap_html)
         elif role == "mp4":
-            await state.update_data(mp4_file_id=fid, mp4_kind=kind)
+            await state.update_data(mp4_file_id=fid, mp4_kind=kind, mp4_caption_html=cap_html)
         else:
             await state.update_data(mkv_file_id=fid, mkv_kind=kind)
         data = await state.get_data()
@@ -550,6 +550,7 @@ async def cb_slot_schedule(callback: CallbackQuery, state: FSMContext):
     await create_release(
         preview_file_id=data["preview_file_id"], caption_html=data.get("caption_html"),
         mp4_file_id=data["mp4_file_id"], mp4_kind=data["mp4_kind"],
+        mp4_caption_html=data.get("mp4_caption_html"),
         mkv_file_id=data["mkv_file_id"], mkv_kind=data["mkv_kind"],
         run_at=data["run_at"], template_id=data["template_id"], episode_no=data["episode_no"],
     )
