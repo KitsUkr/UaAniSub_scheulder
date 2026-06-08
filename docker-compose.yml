@@ -1,0 +1,13 @@
+services:
+  releasebot:
+    container_name: releasebot
+    restart: unless-stopped
+    build: .
+    image: releasebot:latest
+    env_file:
+      - .env
+    environment:
+      # SQLite-файл лежить у змонтованому томі, щоб переживав перезапуски.
+      - DB_PATH=/app/data/releases.db
+    volumes:
+      - ./data:/app/data
