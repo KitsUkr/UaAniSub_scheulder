@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import re
@@ -38,6 +39,16 @@ router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 _KYIV = ZoneInfo(TZ)
 _TAG_RE = re.compile(r"<[^>]+>")
 MAX_EPISODES = 50
+PER_ROW = 6        # кнопок-слотів у рядку
+PER_PAGE = 12      # слотів на сторінці (2 ряди по 6)
+
+# Серіалізує накопичення файлів слота: альбом приходить кількома update'ами
+# майже одночасно — без локу read-modify-write стану може загубити файл.
+_files_lock = asyncio.Lock()
+
+
+def _page_of(episode_no: int) -> int:
+    return (episode_no - 1) // PER_PAGE
 
 
 class TplFSM(StatesGroup):
@@ -48,23 +59,13 @@ class TplFSM(StatesGroup):
 
 
 class SlotFSM(StatesGroup):
-    preview = State()
-    mp4 = State()
-    mkv = State()
-    confirm = State()
+    collect = State()  # один крок: приймаємо превʼю + MP4 + MKV у будь-якому порядку
 
 
 # ── Клавіатури ────────────────────────────────────────────────────────────────
 
 def _cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
-    ])
-
-
-def _confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=texts.BTN_SCHEDULE, callback_data="rel_schedule")],
         [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
     ])
 
@@ -101,29 +102,56 @@ async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
     return header, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _template_view(template_id: int) -> tuple[str | None, InlineKeyboardMarkup | None]:
+async def _template_view(
+    template_id: int, page: int = 0
+) -> tuple[str | None, InlineKeyboardMarkup | None]:
     tpl = await get_template(template_id)
     if not tpl:
         return None, None
+    total = tpl["episodes_count"]
+    pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+    page = max(0, min(page, pages - 1))
     filled = await filled_episodes(template_id)
     wd = tpl["weekday"]
+    start_date = date.fromisoformat(tpl["start_date"])
+
+    start_ep = page * PER_PAGE + 1
+    end_ep = min(total, start_ep + PER_PAGE - 1)
+
     text = texts.TEMPLATE_HEADER.format(
         name=html.escape(tpl["name"]),
-        count=tpl["episodes_count"],
+        count=total,
         weekday=texts.WEEKDAYS_FULL[wd],
         time=tpl["send_time"],
         filled=len(filled),
     )
-    rows: list[list[InlineKeyboardButton]] = []
-    for ep in range(1, tpl["episodes_count"] + 1):
-        d = date.fromisoformat(tpl["start_date"]) + timedelta(days=7 * (ep - 1))
-        mark = "✅" if ep in filled else "⬜"
-        rows.append([InlineKeyboardButton(
-            text=texts.SLOT_BTN.format(
-                mark=mark, n=ep, wd=texts.WEEKDAYS_SHORT[wd], date=d.strftime("%d.%m"),
-            ),
+    d1 = start_date + timedelta(days=7 * (start_ep - 1))
+    d2 = start_date + timedelta(days=7 * (end_ep - 1))
+    text += "\n\n" + texts.SLOT_RANGE.format(
+        a=start_ep, b=end_ep, d1=d1.strftime("%d.%m"), d2=d2.strftime("%d.%m"),
+    )
+
+    # Слоти сторінки — компактні кнопки «✅/⬜ N», по PER_ROW у рядку.
+    buttons = [
+        InlineKeyboardButton(
+            text=texts.SLOT_BTN.format(mark="✅" if ep in filled else "⬜", n=ep),
             callback_data=f"slot:{template_id}:{ep}",
-        )])
+        )
+        for ep in range(start_ep, end_ep + 1)
+    ]
+    rows: list[list[InlineKeyboardButton]] = [
+        buttons[i:i + PER_ROW] for i in range(0, len(buttons), PER_ROW)
+    ]
+
+    if pages > 1:
+        prev_cb = f"anpg:{template_id}:{page - 1}" if page > 0 else "noop"
+        next_cb = f"anpg:{template_id}:{page + 1}" if page < pages - 1 else "noop"
+        rows.append([
+            InlineKeyboardButton(text="‹" if page > 0 else " ", callback_data=prev_cb),
+            InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"),
+            InlineKeyboardButton(text="›" if page < pages - 1 else " ", callback_data=next_cb),
+        ])
+
     rows.append([InlineKeyboardButton(text=texts.BTN_DELETE_ANIME, callback_data=f"anime_del:{template_id}")])
     rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data="anime_list")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -172,11 +200,55 @@ def _slot_run_at(tpl: dict, episode_no: int) -> str:
     return f"{d.isoformat()} {tpl['send_time']}"
 
 
-def _is_ext(document, ext: str, mime: str) -> bool:
-    name = (document.file_name or "").lower()
-    if name.endswith(ext):
-        return True
-    return (document.mime_type or "") == mime
+def _classify(message: Message) -> tuple[str, str, str | None] | None:
+    """Розпізнає вкладення → (роль, file_id, kind) або None.
+    роль ∈ {'preview','mp4','mkv'}; kind — як слати ('video'/'document')."""
+    if message.photo:
+        return ("preview", message.photo[-1].file_id, None)
+    if message.video:
+        return ("mp4", message.video.file_id, "video")
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        mime = (message.document.mime_type or "").lower()
+        if name.endswith(".mkv") or "matroska" in mime:
+            return ("mkv", message.document.file_id, "document")
+        if name.endswith(".mp4") or mime == "video/mp4":
+            return ("mp4", message.document.file_id, "document")
+    return None
+
+
+def _complete(data: dict) -> bool:
+    return bool(
+        data.get("preview_file_id") and data.get("mp4_file_id") and data.get("mkv_file_id")
+    )
+
+
+def _collect_text(data: dict, note: str | None = None) -> str:
+    def mark(key: str) -> str:
+        return "✅" if data.get(key) else "⬜"
+
+    body = "\n".join([
+        texts.SLOT_COLLECT.format(n=data["episode_no"]),
+        "",
+        f"{mark('preview_file_id')} Превʼю",
+        f"{mark('mp4_file_id')} MP4 — Переглянути",
+        f"{mark('mkv_file_id')} MKV — Завантажити",
+    ])
+    if note:
+        body = f"{note}\n\n{body}"
+    if _complete(data):
+        body += "\n\n" + texts.SLOT_READY.format(
+            run_at=data["run_at"], caption=_title(data.get("caption_html")),
+        )
+    return body
+
+
+def _collect_kb(data: dict) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if _complete(data):
+        rows.append([InlineKeyboardButton(text=texts.BTN_SCHEDULE, callback_data="rel_schedule")])
+    rows.append([InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _delete(message: Message) -> None:
@@ -245,6 +317,22 @@ async def cb_anime(callback: CallbackQuery, state: FSMContext):
     if text is None:
         text, kb = await _anime_list_view()
     await _edit_cb(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("anpg:"))
+async def cb_anime_page(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    _, tid_s, pg_s = callback.data.split(":")
+    text, kb = await _template_view(int(tid_s), int(pg_s))
+    if text is None:
+        text, kb = await _anime_list_view()
+    await _edit_cb(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
     await callback.answer()
 
 
@@ -366,13 +454,14 @@ async def _begin_slot_wizard(
         await _edit_cb(callback, text, kb)
         return
     await state.clear()
-    await state.set_state(SlotFSM.preview)
+    await state.set_state(SlotFSM.collect)
     await state.update_data(
         panel_chat=callback.message.chat.id, panel_msg=callback.message.message_id,
         template_id=tid, episode_no=ep, run_at=_slot_run_at(tpl, ep),
         old_release_id=old_release_id,
     )
-    await _edit_cb(callback, texts.SLOT_ASK_PREVIEW.format(n=ep), _cancel_kb())
+    data = await state.get_data()
+    await _edit_cb(callback, _collect_text(data), _collect_kb(data))
 
 
 @router.callback_query(F.data.startswith("slot:"))
@@ -383,8 +472,8 @@ async def cb_slot(callback: CallbackQuery, state: FSMContext):
     if rel:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=texts.BTN_REPLACE, callback_data=f"screp:{tid}:{ep}")],
-            [InlineKeyboardButton(text=texts.BTN_CANCEL_PUB, callback_data=f"scancel:{rel['id']}:{tid}")],
-            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anime:{tid}")],
+            [InlineKeyboardButton(text=texts.BTN_CANCEL_PUB, callback_data=f"scancel:{rel['id']}:{tid}:{ep}")],
+            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anpg:{tid}:{_page_of(ep)}")],
         ])
         await _edit_cb(
             callback,
@@ -408,10 +497,10 @@ async def cb_slot_replace(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("scancel:"))
 async def cb_slot_cancelpub(callback: CallbackQuery, state: FSMContext):
-    _, rel_s, tid_s = callback.data.split(":")
+    _, rel_s, tid_s, ep_s = callback.data.split(":")
     await cancel_release(int(rel_s))
     await state.clear()
-    text, kb = await _template_view(int(tid_s))
+    text, kb = await _template_view(int(tid_s), _page_of(int(ep_s)))
     if text is None:
         text, kb = await _anime_list_view()
     await _edit_cb(callback, text, kb)
@@ -422,83 +511,40 @@ async def cb_slot_cancelpub(callback: CallbackQuery, state: FSMContext):
 #   Майстер заповнення слота
 # ══════════════════════════════════════════════════════════════════════════════
 
-@router.message(SlotFSM.preview)
-async def slot_preview(message: Message, state: FSMContext):
-    data = await state.get_data()
-    ep = data["episode_no"]
-    if not message.photo:
-        await _delete(message)
-        await _edit_panel(
-            message.bot, data,
-            f"{texts.ERR_NEED_PHOTO}\n\n{texts.SLOT_ASK_PREVIEW.format(n=ep)}", _cancel_kb(),
-        )
-        return
-    caption_html = message.html_text if message.caption else None
+@router.message(SlotFSM.collect)
+async def slot_collect(message: Message, state: FSMContext):
+    """Приймає превʼю/MP4/MKV у будь-якому порядку (зокрема альбомом),
+    сам розкладає за типом. Коли всі три зібрані — зʼявляється «Запланувати»."""
+    res = _classify(message)
+    caption_html = (
+        message.html_text if (res and res[0] == "preview" and message.caption) else None
+    )
     await _delete(message)
-    await state.update_data(preview_file_id=message.photo[-1].file_id, caption_html=caption_html)
-    await state.set_state(SlotFSM.mp4)
-    prompt = texts.SLOT_ASK_MP4.format(n=ep)
-    if not caption_html:
-        prompt = f"{texts.WARN_NO_CAPTION}\n\n{prompt}"
-    await _edit_panel(message.bot, data, prompt, _cancel_kb())
+    # Лок: альбом дає кілька паралельних update'ів — read-modify-write має бути атомарним.
+    async with _files_lock:
+        data = await state.get_data()
+        if res is None:
+            await _edit_panel(
+                message.bot, data, _collect_text(data, note=texts.ERR_NEED_FILE), _collect_kb(data)
+            )
+            return
+        role, fid, kind = res
+        if role == "preview":
+            await state.update_data(preview_file_id=fid, caption_html=caption_html)
+        elif role == "mp4":
+            await state.update_data(mp4_file_id=fid, mp4_kind=kind)
+        else:
+            await state.update_data(mkv_file_id=fid, mkv_kind=kind)
+        data = await state.get_data()
+        await _edit_panel(message.bot, data, _collect_text(data), _collect_kb(data))
 
 
-@router.message(SlotFSM.mp4)
-async def slot_mp4(message: Message, state: FSMContext):
-    data = await state.get_data()
-    ep = data["episode_no"]
-    warn = None
-    if message.video:
-        fid, kind = message.video.file_id, "video"
-    elif message.document and _is_ext(message.document, ".mp4", "video/mp4"):
-        fid, kind = message.document.file_id, "document"
-        warn = texts.WARN_MP4_AS_DOC
-    else:
-        await _delete(message)
-        await _edit_panel(
-            message.bot, data,
-            f"{texts.ERR_NEED_MP4}\n\n{texts.SLOT_ASK_MP4.format(n=ep)}", _cancel_kb(),
-        )
-        return
-    await _delete(message)
-    await state.update_data(mp4_file_id=fid, mp4_kind=kind)
-    await state.set_state(SlotFSM.mkv)
-    prompt = texts.SLOT_ASK_MKV.format(n=ep)
-    if warn:
-        prompt = f"{warn}\n\n{prompt}"
-    await _edit_panel(message.bot, data, prompt, _cancel_kb())
-
-
-@router.message(SlotFSM.mkv)
-async def slot_mkv(message: Message, state: FSMContext):
-    data = await state.get_data()
-    ep = data["episode_no"]
-    if not message.document:
-        await _delete(message)
-        await _edit_panel(
-            message.bot, data,
-            f"{texts.ERR_NEED_MKV}\n\n{texts.SLOT_ASK_MKV.format(n=ep)}", _cancel_kb(),
-        )
-        return
-    name = message.document.file_name or ""
-    fid = message.document.file_id
-    await _delete(message)
-    await state.update_data(mkv_file_id=fid, mkv_kind="document")
-    await state.set_state(SlotFSM.confirm)
-    text = texts.SLOT_CONFIRM.format(n=ep, run_at=data["run_at"], caption=_title(data.get("caption_html")))
-    if not name.lower().endswith(".mkv"):
-        text = f"{texts.WARN_NOT_MKV.format(name=name or '—')}\n\n{text}"
-    await _edit_panel(message.bot, data, text, _confirm_kb())
-
-
-@router.message(SlotFSM.confirm)
-async def slot_confirm_stray(message: Message):
-    await _delete(message)
-
-
-@router.callback_query(SlotFSM.confirm, F.data == "rel_schedule")
+@router.callback_query(SlotFSM.collect, F.data == "rel_schedule")
 async def cb_slot_schedule(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    if not _complete(data):
+        await callback.answer(texts.NEED_ALL_FILES, show_alert=True)
+        return
     if data.get("old_release_id"):
         await cancel_release(data["old_release_id"])
     await create_release(
@@ -508,11 +554,12 @@ async def cb_slot_schedule(callback: CallbackQuery, state: FSMContext):
         run_at=data["run_at"], template_id=data["template_id"], episode_no=data["episode_no"],
     )
     tid = data["template_id"]
+    ep = data["episode_no"]
     await state.clear()
-    text, kb = await _template_view(tid)
+    text, kb = await _template_view(tid, _page_of(ep))
     await _edit_cb(callback, text, kb)
     await callback.answer(texts.SCHEDULED_TOAST)
-    logger.info("Заплановано серію %s аніме #%s на %s", data["episode_no"], tid, data["run_at"])
+    logger.info("Заплановано серію %s аніме #%s на %s", ep, tid, data["run_at"])
 
 
 # ── Скасування активного майстра ──────────────────────────────────────────────
@@ -521,9 +568,10 @@ async def cb_slot_schedule(callback: CallbackQuery, state: FSMContext):
 async def cb_cancel(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     tid = data.get("template_id")
+    ep = data.get("episode_no")
     await state.clear()
     if tid:
-        text, kb = await _template_view(tid)
+        text, kb = await _template_view(tid, _page_of(ep) if ep else 0)
         if text is None:
             text, kb = await _anime_list_view()
     else:
