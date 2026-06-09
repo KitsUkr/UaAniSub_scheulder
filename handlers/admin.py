@@ -63,6 +63,7 @@ class TplFSM(StatesGroup):
     count = State()
     weekday = State()
     time = State()
+    firstdate = State()
 
 
 class SlotFSM(StatesGroup):
@@ -73,6 +74,13 @@ class SlotFSM(StatesGroup):
 
 def _cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
+    ])
+
+
+def _firstdate_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=texts.BTN_SKIP, callback_data="tplskip")],
         [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
     ])
 
@@ -205,6 +213,20 @@ def _compute_start_date(weekday: int, send_time: str) -> str:
 def _slot_run_at(tpl: dict, episode_no: int) -> str:
     d = date.fromisoformat(tpl["start_date"]) + timedelta(days=7 * (episode_no - 1))
     return f"{d.isoformat()} {tpl['send_time']}"
+
+
+def _past_episodes(start_date_iso: str, count: int) -> int:
+    """Скільки перших серій уже мали б вийти (їх дата раніше за сьогодні, Київ).
+    Використовується для авто-позначки «викладено вручну» в уже активних аніме."""
+    start = date.fromisoformat(start_date_iso)
+    today = datetime.now(_KYIV).date()
+    n = 0
+    for e in range(count):
+        if start + timedelta(days=7 * e) < today:
+            n += 1
+        else:
+            break
+    return n
 
 
 def _classify(message: Message) -> tuple[str, str, str | None] | None:
@@ -436,15 +458,65 @@ async def tpl_time(message: Message, state: FSMContext):
             message.bot, data, f"{texts.ERR_BAD_TIME}\n\n{texts.TPL_ASK_TIME}", _cancel_kb()
         )
         return
-    start_date = _compute_start_date(data["weekday"], hhmm)
+    await state.update_data(time=hhmm)
+    await state.set_state(TplFSM.firstdate)
+    wd_name = texts.WEEKDAYS_FULL[data["weekday"]].lower()
+    await _edit_panel(
+        message.bot, data, texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name), _firstdate_kb()
+    )
+
+
+async def _create_template_and_show(
+    bot, state: FSMContext, data: dict, start_date: str, manual_done: int
+) -> None:
     tid = await create_template(
-        name=data["name"], weekday=data["weekday"], send_time=hhmm,
-        episodes_count=data["count"], start_date=start_date,
+        name=data["name"], weekday=data["weekday"], send_time=data["time"],
+        episodes_count=data["count"], start_date=start_date, manual_done=manual_done,
     )
     await state.clear()
     text, kb = await _template_view(tid)
-    await _edit_panel(message.bot, data, text, kb)
-    logger.info("Створено аніме #%d «%s» (%s)", tid, data["name"], start_date)
+    await _edit_panel(bot, data, text, kb)
+    logger.info(
+        "Створено аніме #%d «%s» (старт %s, вручну=%d)",
+        tid, data["name"], start_date, manual_done,
+    )
+
+
+@router.message(TplFSM.firstdate)
+async def tpl_firstdate(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    await _delete(message)
+    data = await state.get_data()
+    wd = data["weekday"]
+    wd_name = texts.WEEKDAYS_FULL[wd].lower()
+    try:
+        d = date.fromisoformat(raw)
+    except ValueError:
+        await _edit_panel(
+            message.bot, data,
+            f"{texts.ERR_BAD_DATE}\n\n{texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name)}",
+            _firstdate_kb(),
+        )
+        return
+    if d.weekday() != wd:
+        await _edit_panel(
+            message.bot, data,
+            f"{texts.ERR_DATE_WEEKDAY.format(date=d.isoformat(), weekday=wd_name)}\n\n"
+            f"{texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name)}",
+            _firstdate_kb(),
+        )
+        return
+    start_date = d.isoformat()
+    manual_done = _past_episodes(start_date, data["count"])
+    await _create_template_and_show(message.bot, state, data, start_date, manual_done)
+
+
+@router.callback_query(TplFSM.firstdate, F.data == "tplskip")
+async def tpl_skip(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    start_date = _compute_start_date(data["weekday"], data["time"])
+    await _create_template_and_show(callback.bot, state, data, start_date, 1)
+    await callback.answer()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
