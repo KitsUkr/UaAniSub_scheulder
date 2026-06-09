@@ -47,18 +47,32 @@ PER_PAGE = 12      # слотів на сторінці (2 ряди по 6)
 _files_lock = asyncio.Lock()
 
 
-def _page_of(episode_no: int) -> int:
-    return (episode_no - 1) // PER_PAGE
+def _first_ep(tpl: dict) -> int:
+    """Номер першої серії: 0, якщо є нульова, інакше 1."""
+    return 0 if tpl.get("has_zero") else 1
+
+
+def _page_of(episode_no: int, first_ep: int = 1) -> int:
+    return max(0, (episode_no - first_ep) // PER_PAGE)
 
 
 def _done_episodes(tpl: dict, filled: set[int]) -> set[int]:
     """Серії, що вважаються готовими: реальні релізи ∪ перші manual_done
-    (їх адмін викладає вручну поза ботом)."""
-    manual = min(int(tpl.get("manual_done") or 0), tpl["episodes_count"])
-    return filled | set(range(1, manual + 1))
+    (їх адмін викладає вручну поза ботом). Відлік — від першої серії (0 або 1)."""
+    first = _first_ep(tpl)
+    manual = int(tpl.get("manual_done") or 0)
+    manual_set = set(range(first, min(first + manual, tpl["episodes_count"] + 1)))
+    return filled | manual_set
+
+
+def _is_manual(tpl: dict, ep: int) -> bool:
+    """Чи входить серія в перші manual_done (викладена вручну, без релізу)."""
+    first = _first_ep(tpl)
+    return first <= ep < first + int(tpl.get("manual_done") or 0)
 
 
 class TplFSM(StatesGroup):
+    has_zero = State()
     name = State()
     count = State()
     weekday = State()
@@ -85,6 +99,24 @@ def _firstdate_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _yesno_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=texts.BTN_YES, callback_data="tplz:1"),
+            InlineKeyboardButton(text=texts.BTN_NO, callback_data="tplz:0"),
+        ],
+        [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
+    ])
+
+
+def _firstdate_prompt(data: dict) -> str:
+    wd_name = texts.WEEKDAYS_FULL[data["weekday"]].lower()
+    prompt = texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name)
+    if data.get("has_zero"):
+        prompt += "\n\n" + texts.TPL_FIRSTDATE_ZERO_NOTE
+    return prompt
+
+
 def _weekday_kb() -> InlineKeyboardMarkup:
     row1 = [InlineKeyboardButton(text=texts.WEEKDAYS_SHORT[i], callback_data=f"tplwd:{i}") for i in range(4)]
     row2 = [InlineKeyboardButton(text=texts.WEEKDAYS_SHORT[i], callback_data=f"tplwd:{i}") for i in range(4, 7)]
@@ -107,8 +139,9 @@ async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
     rows: list[list[InlineKeyboardButton]] = []
     for t in tpls:
         done = len(_done_episodes(t, await filled_episodes(t["id"])))
+        total = t["episodes_count"] - _first_ep(t) + 1
         rows.append([InlineKeyboardButton(
-            text=texts.ANIME_BTN.format(name=t["name"], filled=done, count=t["episodes_count"]),
+            text=texts.ANIME_BTN.format(name=t["name"], filled=done, count=total),
             callback_data=f"anime:{t['id']}",
         )])
     rows.append([InlineKeyboardButton(text=texts.BTN_NEW_ANIME, callback_data="anime_new")])
@@ -123,19 +156,21 @@ async def _template_view(
     tpl = await get_template(template_id)
     if not tpl:
         return None, None
-    total = tpl["episodes_count"]
-    pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+    first = _first_ep(tpl)
+    last = tpl["episodes_count"]
+    total_slots = last - first + 1
+    pages = max(1, (total_slots + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, pages - 1))
     done = _done_episodes(tpl, await filled_episodes(template_id))
     wd = tpl["weekday"]
     start_date = date.fromisoformat(tpl["start_date"])
 
-    start_ep = page * PER_PAGE + 1
-    end_ep = min(total, start_ep + PER_PAGE - 1)
+    start_ep = first + page * PER_PAGE
+    end_ep = min(last, start_ep + PER_PAGE - 1)
 
     text = texts.TEMPLATE_HEADER.format(
         name=html.escape(tpl["name"]),
-        count=total,
+        count=total_slots,
         weekday=texts.WEEKDAYS_FULL[wd],
         time=tpl["send_time"],
         filled=len(done),
@@ -215,14 +250,15 @@ def _slot_run_at(tpl: dict, episode_no: int) -> str:
     return f"{d.isoformat()} {tpl['send_time']}"
 
 
-def _past_episodes(start_date_iso: str, count: int) -> int:
+def _past_episodes(start_date_iso: str, first_ep: int, last_ep: int) -> int:
     """Скільки перших серій уже мали б вийти (їх дата раніше за сьогодні, Київ).
-    Використовується для авто-позначки «викладено вручну» в уже активних аніме."""
+    Дата серії e = start_date + 7*(e-1) (start_date — дата серії 1, нульова — на
+    тиждень раніше). Використовується для авто-позначки «викладено вручну»."""
     start = date.fromisoformat(start_date_iso)
     today = datetime.now(_KYIV).date()
     n = 0
-    for e in range(count):
-        if start + timedelta(days=7 * e) < today:
+    for e in range(first_ep, last_ep + 1):
+        if start + timedelta(days=7 * (e - 1)) < today:
             n += 1
         else:
             break
@@ -398,10 +434,19 @@ async def cb_anime_delyes(callback: CallbackQuery):
 @router.callback_query(F.data == "anime_new")
 async def cb_anime_new(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await state.set_state(TplFSM.name)
+    await state.set_state(TplFSM.has_zero)
     await state.update_data(
         panel_chat=callback.message.chat.id, panel_msg=callback.message.message_id,
     )
+    await _edit_cb(callback, texts.TPL_ASK_ZERO, _yesno_kb())
+    await callback.answer()
+
+
+@router.callback_query(TplFSM.has_zero, F.data.startswith("tplz:"))
+async def tpl_has_zero(callback: CallbackQuery, state: FSMContext):
+    hz = int(callback.data.split(":")[1])
+    await state.update_data(has_zero=hz)
+    await state.set_state(TplFSM.name)
     await _edit_cb(callback, texts.TPL_ASK_NAME, _cancel_kb())
     await callback.answer()
 
@@ -460,10 +505,8 @@ async def tpl_time(message: Message, state: FSMContext):
         return
     await state.update_data(time=hhmm)
     await state.set_state(TplFSM.firstdate)
-    wd_name = texts.WEEKDAYS_FULL[data["weekday"]].lower()
-    await _edit_panel(
-        message.bot, data, texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name), _firstdate_kb()
-    )
+    data = await state.get_data()
+    await _edit_panel(message.bot, data, _firstdate_prompt(data), _firstdate_kb())
 
 
 async def _create_template_and_show(
@@ -472,6 +515,7 @@ async def _create_template_and_show(
     tid = await create_template(
         name=data["name"], weekday=data["weekday"], send_time=data["time"],
         episodes_count=data["count"], start_date=start_date, manual_done=manual_done,
+        has_zero=int(data.get("has_zero") or 0),
     )
     await state.clear()
     text, kb = await _template_view(tid)
@@ -493,21 +537,19 @@ async def tpl_firstdate(message: Message, state: FSMContext):
         d = date.fromisoformat(raw)
     except ValueError:
         await _edit_panel(
-            message.bot, data,
-            f"{texts.ERR_BAD_DATE}\n\n{texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name)}",
-            _firstdate_kb(),
+            message.bot, data, f"{texts.ERR_BAD_DATE}\n\n{_firstdate_prompt(data)}", _firstdate_kb()
         )
         return
     if d.weekday() != wd:
         await _edit_panel(
             message.bot, data,
             f"{texts.ERR_DATE_WEEKDAY.format(date=d.isoformat(), weekday=wd_name)}\n\n"
-            f"{texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name)}",
+            f"{_firstdate_prompt(data)}",
             _firstdate_kb(),
         )
         return
     start_date = d.isoformat()
-    manual_done = _past_episodes(start_date, data["count"])
+    manual_done = _past_episodes(start_date, _first_ep(data), data["count"])
     await _create_template_and_show(message.bot, state, data, start_date, manual_done)
 
 
@@ -547,12 +589,19 @@ async def _begin_slot_wizard(
 async def cb_slot(callback: CallbackQuery, state: FSMContext):
     _, tid_s, ep_s = callback.data.split(":")
     tid, ep = int(tid_s), int(ep_s)
+    tpl = await get_template(tid)
+    if not tpl:
+        text, kb = await _anime_list_view()
+        await _edit_cb(callback, text, kb)
+        await callback.answer()
+        return
+    page = _page_of(ep, _first_ep(tpl))
     rel = await get_release_by_slot(tid, ep)
     if rel:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=texts.BTN_REPLACE, callback_data=f"screp:{tid}:{ep}")],
             [InlineKeyboardButton(text=texts.BTN_CANCEL_PUB, callback_data=f"scancel:{rel['id']}:{tid}:{ep}")],
-            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anpg:{tid}:{_page_of(ep)}")],
+            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anpg:{tid}:{page}")],
         ])
         await _edit_cb(
             callback,
@@ -561,12 +610,11 @@ async def cb_slot(callback: CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
-    # Серія з-поміж перших manual_done — викладається вручну поза ботом.
-    tpl = await get_template(tid)
-    if tpl and ep <= (tpl.get("manual_done") or 0):
+    # Серія з перших manual_done — викладається вручну поза ботом.
+    if _is_manual(tpl, ep):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=texts.BTN_FILL_VIA_BOT, callback_data=f"slotfill:{tid}:{ep}")],
-            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anpg:{tid}:{_page_of(ep)}")],
+            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anpg:{tid}:{page}")],
         ])
         await _edit_cb(callback, texts.SLOT_MANUAL.format(n=ep), kb)
         await callback.answer()
@@ -596,7 +644,9 @@ async def cb_slot_cancelpub(callback: CallbackQuery, state: FSMContext):
     _, rel_s, tid_s, ep_s = callback.data.split(":")
     await cancel_release(int(rel_s))
     await state.clear()
-    text, kb = await _template_view(int(tid_s), _page_of(int(ep_s)))
+    tpl = await get_template(int(tid_s))
+    page = _page_of(int(ep_s), _first_ep(tpl)) if tpl else 0
+    text, kb = await _template_view(int(tid_s), page)
     if text is None:
         text, kb = await _anime_list_view()
     await _edit_cb(callback, text, kb)
@@ -653,7 +703,9 @@ async def cb_slot_schedule(callback: CallbackQuery, state: FSMContext):
     tid = data["template_id"]
     ep = data["episode_no"]
     await state.clear()
-    text, kb = await _template_view(tid, _page_of(ep))
+    tpl = await get_template(tid)
+    page = _page_of(ep, _first_ep(tpl)) if tpl else 0
+    text, kb = await _template_view(tid, page)
     await _edit_cb(callback, text, kb)
     await callback.answer(texts.SCHEDULED_TOAST)
     logger.info("Заплановано серію %s аніме #%s на %s", ep, tid, data["run_at"])
@@ -668,7 +720,9 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
     ep = data.get("episode_no")
     await state.clear()
     if tid:
-        text, kb = await _template_view(tid, _page_of(ep) if ep else 0)
+        tpl = await get_template(tid)
+        page = _page_of(ep, _first_ep(tpl)) if (tpl and ep is not None) else 0
+        text, kb = await _template_view(tid, page)
         if text is None:
             text, kb = await _anime_list_view()
     else:

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS templates (
     episodes_count  INTEGER NOT NULL,
     start_date      TEXT NOT NULL,              -- 'YYYY-MM-DD' (дата серії 1)
     manual_done     INTEGER NOT NULL DEFAULT 1, -- скільки перших серій уже викладено вручну
+    has_zero        INTEGER NOT NULL DEFAULT 0, -- чи є нульова серія (відлік з 0)
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -85,6 +86,10 @@ async def _migrate() -> None:
         await _conn().execute(
             "ALTER TABLE templates ADD COLUMN manual_done INTEGER NOT NULL DEFAULT 1"
         )
+    if "has_zero" not in tcols:
+        await _conn().execute(
+            "ALTER TABLE templates ADD COLUMN has_zero INTEGER NOT NULL DEFAULT 0"
+        )
     # Індекс по слоту створюємо тут — після того, як колонки гарантовано є
     # (на старій БД їх ще не було під час executescript).
     await _conn().execute(
@@ -116,13 +121,15 @@ async def create_template(
     episodes_count: int,
     start_date: str,
     manual_done: int = 1,
+    has_zero: int = 0,
 ) -> int:
     cur = await _conn().execute(
         """
-        INSERT INTO templates (name, weekday, send_time, episodes_count, start_date, manual_done)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO templates
+            (name, weekday, send_time, episodes_count, start_date, manual_done, has_zero)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, weekday, send_time, episodes_count, start_date, manual_done),
+        (name, weekday, send_time, episodes_count, start_date, manual_done, has_zero),
     )
     await _conn().commit()
     return cur.lastrowid
@@ -131,7 +138,7 @@ async def create_template(
 async def list_templates() -> list[dict]:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero
         FROM templates
         ORDER BY created_at
         """,
@@ -142,7 +149,7 @@ async def list_templates() -> list[dict]:
 async def get_template(template_id: int) -> dict | None:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero
         FROM templates WHERE id = ?
         """,
         (template_id,),
