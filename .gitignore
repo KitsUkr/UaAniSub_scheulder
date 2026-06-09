@@ -5,3 +5,5 @@ bot.log*
 __pycache__/
 *.pyc
 data/
+releases.db-shm
+releases.db-wal

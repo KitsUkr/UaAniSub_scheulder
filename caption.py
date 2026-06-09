@@ -14,8 +14,10 @@ import re
 WATCH_WORD = "Переглянути"
 DOWNLOAD_WORD = "Завантажити"
 
-# Уже наявні посилання в підписі захищаємо: не чіпаємо слово, якщо воно
-# всередині <a ...>...</a> (інакше отримаємо вкладений тег).
+# Розбиваємо наявне посилання на частини: відкривний тег / видимий текст / </a>.
+# Так ми можемо переставити href, зберігши сам текст посилання.
+_ANCHOR_PARTS_RE = re.compile(r"(<a\b[^>]*>)(.*?)(</a>)", re.IGNORECASE | re.DOTALL)
+# Просто межі посилань — щоб не обгортати слово, що вже всередині <a> (без вкладень).
 _ANCHOR_RE = re.compile(r"<a\b[^>]*>.*?</a>", re.IGNORECASE | re.DOTALL)
 
 
@@ -24,8 +26,26 @@ def _anchor(word: str, url: str) -> str:
 
 
 def _link_word(text: str, word: str, url: str) -> tuple[str, bool]:
-    """Обгортає перше входження `word` поза наявними <a>-тегами посиланням.
-    Повертає (новий_текст, чи_замінили)."""
+    """Гарантує, що `word` у підписі веде на `url`. Повертає (новий_текст, чи_знайшли).
+
+    Якщо слово вже є посиланням (адмін прислав превʼю зі старими посиланнями на
+    попередню серію) — переставляємо href цього <a> на новий `url`, зберігши текст.
+    Якщо слово — звичайний текст поза посиланнями — обгортаємо його в нове <a>."""
+    # 1) Слово вже всередині <a>…</a> → міняємо лише href першого такого посилання.
+    retargeted = False
+
+    def _swap(m: re.Match) -> str:
+        nonlocal retargeted
+        if retargeted or word not in m.group(2):
+            return m.group(0)
+        retargeted = True
+        return f'<a href="{html.escape(url, quote=True)}">{m.group(2)}</a>'
+
+    new_text = _ANCHOR_PARTS_RE.sub(_swap, text)
+    if retargeted:
+        return new_text, True
+
+    # 2) Слово — звичайний текст → обгортаємо перше входження поза наявними <a>.
     spans = [m.span() for m in _ANCHOR_RE.finditer(text)]
     start = 0
     while True:
