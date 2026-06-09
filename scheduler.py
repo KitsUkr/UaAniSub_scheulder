@@ -8,10 +8,12 @@
 import asyncio
 import html
 import logging
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import texts
@@ -28,16 +30,38 @@ _DT_FMT = "%Y-%m-%d %H:%M"
 def _msg_link(channel: str, message_id: int) -> str:
     return f"https://t.me/{channel.lstrip('@')}/{message_id}"
 
+_TG_EMOJI_RE = re.compile(r"<tg-emoji\b[^>]*>(.*?)</tg-emoji>", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_custom_emoji(caption: str | None) -> str | None:
+    if not caption or "<tg-emoji" not in caption.lower():
+        return caption
+    return _TG_EMOJI_RE.sub(lambda m: m.group(1), caption)
+
+
+async def _send_with_emoji_fallback(send, caption: str | None):
+    """Викликає send(caption); якщо Telegram відхилив через премʼєм-емодзі —
+    повторює раз без них. Інші BadRequest прокидає далі (не маскуємо)."""
+    try:
+        return await send(caption)
+    except TelegramBadRequest:
+        stripped = _strip_custom_emoji(caption)
+        if stripped == caption:  # помилка не в емодзі — не приховуємо її повтором
+            raise
+        logger.warning("Премʼєм-емодзі недоступні боту — публікую з фолбеком")
+        return await send(stripped)
+
 
 async def _send_media(bot: Bot, file_id: str, kind: str, caption: str | None = None):
-    """Репост файлу за file_id (без завантаження/перезаливки — будь-який розмір).
-    Метод відповідає способу отримання: video → відтворюється inline,
-    document → завантажується. caption (HTML) кріпиться під медіа."""
-    if kind == "video":
-        return await bot.send_video(
-            RELEASE_CHANNEL, file_id, caption=caption, supports_streaming=True
-        )
-    return await bot.send_document(RELEASE_CHANNEL, file_id, caption=caption)
+
+    async def _do(cap: str | None):
+        if kind == "video":
+            return await bot.send_video(
+                RELEASE_CHANNEL, file_id, caption=cap, supports_streaming=True
+            )
+        return await bot.send_document(RELEASE_CHANNEL, file_id, caption=cap)
+
+    return await _send_with_emoji_fallback(_do, caption)
 
 
 async def _publish_one(bot: Bot, r: dict) -> None:
@@ -49,7 +73,10 @@ async def _publish_one(bot: Bot, r: dict) -> None:
     download = _msg_link(RELEASE_CHANNEL, mkv_msg.message_id)
     caption = render_caption(r["caption_html"], watch, download)
 
-    await bot.send_photo(PREVIEW_CHANNEL, r["preview_file_id"], caption=caption)
+    await _send_with_emoji_fallback(
+        lambda cap: bot.send_photo(PREVIEW_CHANNEL, r["preview_file_id"], caption=cap),
+        caption,
+    )
 
 
 async def _alert_admins(bot: Bot, r: dict, exc: Exception) -> None:
