@@ -73,6 +73,7 @@ def _is_manual(tpl: dict, ep: int) -> bool:
 
 class TplFSM(StatesGroup):
     has_zero = State()
+    firstday = State()
     name = State()
     count = State()
     weekday = State()
@@ -161,7 +162,6 @@ async def _template_view(
     page = max(0, min(page, pages - 1))
     done = _done_episodes(tpl, await filled_episodes(template_id))
     wd = tpl["weekday"]
-    start_date = date.fromisoformat(tpl["start_date"])
 
     start_ep = first + page * PER_PAGE
     end_ep = min(last, start_ep + PER_PAGE - 1)
@@ -173,8 +173,8 @@ async def _template_view(
         time=tpl["send_time"],
         filled=len(done),
     )
-    d1 = start_date + timedelta(days=7 * (start_ep - first))
-    d2 = start_date + timedelta(days=7 * (end_ep - first))
+    d1 = _slot_date(tpl, start_ep)
+    d2 = _slot_date(tpl, end_ep)
     text += "\n\n" + texts.SLOT_RANGE.format(
         a=start_ep, b=end_ep, d1=d1.strftime("%d.%m"), d2=d2.strftime("%d.%m"),
     )
@@ -243,21 +243,27 @@ def _compute_start_date(weekday: int, send_time: str) -> str:
     return start.isoformat()
 
 
+def _slot_date(tpl: dict, episode_no: int) -> date:
+    """Дата виходу серії. Перші first_day серій — в один день (start_date),
+    далі — по одній на тиждень. start_date — дата першої серії (0-ї або 1-ї)."""
+    pos = episode_no - _first_ep(tpl)
+    week = max(0, pos - int(tpl.get("first_day") or 1) + 1)
+    return date.fromisoformat(tpl["start_date"]) + timedelta(days=7 * week)
+
+
 def _slot_run_at(tpl: dict, episode_no: int) -> str:
-    # start_date — дата ПЕРШОЇ серії (нульової, якщо є; інакше 1-ї).
-    d = date.fromisoformat(tpl["start_date"]) + timedelta(days=7 * (episode_no - _first_ep(tpl)))
-    return f"{d.isoformat()} {tpl['send_time']}"
+    return f"{_slot_date(tpl, episode_no).isoformat()} {tpl['send_time']}"
 
 
-def _past_episodes(start_date_iso: str, first_ep: int, last_ep: int) -> int:
+def _past_episodes(start_date_iso: str, first_ep: int, last_ep: int, first_day: int) -> int:
     """Скільки перших серій уже мали б вийти (їх дата раніше за сьогодні, Київ).
-    start_date — дата першої серії (first_ep); дата серії e = start + 7*(e-first_ep).
-    Використовується для авто-позначки «викладено вручну»."""
+    Враховує, що перші first_day серій виходять одного дня (start_date)."""
     start = date.fromisoformat(start_date_iso)
     today = datetime.now(_KYIV).date()
     n = 0
     for e in range(first_ep, last_ep + 1):
-        if start + timedelta(days=7 * (e - first_ep)) < today:
+        week = max(0, (e - first_ep) - first_day + 1)
+        if start + timedelta(days=7 * week) < today:
             n += 1
         else:
             break
@@ -445,9 +451,24 @@ async def cb_anime_new(callback: CallbackQuery, state: FSMContext):
 async def tpl_has_zero(callback: CallbackQuery, state: FSMContext):
     hz = int(callback.data.split(":")[1])
     await state.update_data(has_zero=hz)
-    await state.set_state(TplFSM.name)
-    await _edit_cb(callback, texts.TPL_ASK_NAME, _cancel_kb())
+    await state.set_state(TplFSM.firstday)
+    await _edit_cb(callback, texts.TPL_ASK_FIRSTDAY, _cancel_kb())
     await callback.answer()
+
+
+@router.message(TplFSM.firstday)
+async def tpl_firstday(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    await _delete(message)
+    data = await state.get_data()
+    if not raw.isdigit() or not (1 <= int(raw) <= MAX_EPISODES):
+        await _edit_panel(
+            message.bot, data, f"{texts.ERR_BAD_FIRSTDAY}\n\n{texts.TPL_ASK_FIRSTDAY}", _cancel_kb()
+        )
+        return
+    await state.update_data(first_day=int(raw))
+    await state.set_state(TplFSM.name)
+    await _edit_panel(message.bot, data, texts.TPL_ASK_NAME, _cancel_kb())
 
 
 @router.message(TplFSM.name)
@@ -514,7 +535,7 @@ async def _create_template_and_show(
     tid = await create_template(
         name=data["name"], weekday=data["weekday"], send_time=data["time"],
         episodes_count=data["count"], start_date=start_date, manual_done=manual_done,
-        has_zero=int(data.get("has_zero") or 0),
+        has_zero=int(data.get("has_zero") or 0), first_day=int(data.get("first_day") or 1),
     )
     await state.clear()
     text, kb = await _template_view(tid)
@@ -548,7 +569,8 @@ async def tpl_firstdate(message: Message, state: FSMContext):
         )
         return
     start_date = d.isoformat()
-    manual_done = _past_episodes(start_date, _first_ep(data), data["count"])
+    first_day = int(data.get("first_day") or 1)
+    manual_done = _past_episodes(start_date, _first_ep(data), data["count"], first_day)
     await _create_template_and_show(message.bot, state, data, start_date, manual_done)
 
 
@@ -556,7 +578,10 @@ async def tpl_firstdate(message: Message, state: FSMContext):
 async def tpl_skip(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     start_date = _compute_start_date(data["weekday"], data["time"])
-    await _create_template_and_show(callback.bot, state, data, start_date, 1)
+    # Новий старт: перший день (first_day серій) викладається вручну → позначаємо готовим.
+    await _create_template_and_show(
+        callback.bot, state, data, start_date, int(data.get("first_day") or 1)
+    )
     await callback.answer()
 
 
