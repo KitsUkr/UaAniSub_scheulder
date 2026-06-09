@@ -64,6 +64,8 @@ async def init_db() -> None:
         os.makedirs(parent, exist_ok=True)
     _db = await aiosqlite.connect(DB_PATH)
     _db.row_factory = aiosqlite.Row
+    # WAL: читання не блокується записом + краща стійкість до збоїв.
+    await _db.execute("PRAGMA journal_mode=WAL")
     await _db.executescript(_SCHEMA)
     await _db.commit()
     await _migrate()
@@ -212,13 +214,23 @@ async def create_release(
     return cur.lastrowid
 
 
-async def filled_episodes(template_id: int) -> set[int]:
-    """Номери серій шаблону, що вже мають реліз (будь-якого статусу) — для ✅."""
+async def episode_statuses(template_id: int) -> dict[int, str]:
+    """Останній статус релізу для кожної серії шаблону: episode_no → status
+    ('pending' — заплановано ⏳, 'sent' — опубліковано ✅, 'failed').
+    Беремо MAX(id), бо «Замінити» лишає старий реліз і додає новий."""
     cur = await _conn().execute(
-        "SELECT episode_no FROM releases WHERE template_id = ? AND episode_no IS NOT NULL",
+        """
+        SELECT episode_no, status
+        FROM releases r
+        WHERE template_id = ? AND episode_no IS NOT NULL
+          AND id = (
+            SELECT MAX(id) FROM releases
+            WHERE template_id = r.template_id AND episode_no = r.episode_no
+          )
+        """,
         (template_id,),
     )
-    return {row["episode_no"] for row in await cur.fetchall()}
+    return {row["episode_no"]: row["status"] for row in await cur.fetchall()}
 
 
 async def get_release_by_slot(template_id: int, episode_no: int) -> dict | None:

@@ -23,7 +23,7 @@ from database import (
     create_release,
     create_template,
     delete_template,
-    filled_episodes,
+    episode_statuses,
     get_release_by_slot,
     get_template,
     list_templates,
@@ -69,6 +69,16 @@ def _is_manual(tpl: dict, ep: int) -> bool:
     """Чи входить серія в перші manual_done (викладена вручну, без релізу)."""
     first = _first_ep(tpl)
     return first <= ep < first + int(tpl.get("manual_done") or 0)
+
+
+def _slot_mark(tpl: dict, statuses: dict[int, str], ep: int) -> str:
+    """Позначка слота: ⏳ заплановано (pending), ✅ опубліковано (sent/вручну),
+    ⬜ порожньо. Реальний реліз має пріоритет над ручною позначкою."""
+    if statuses.get(ep) == "pending":
+        return "⏳"
+    if ep in statuses or _is_manual(tpl, ep):
+        return "✅"
+    return "⬜"
 
 
 class TplFSM(StatesGroup):
@@ -137,7 +147,7 @@ async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
     tpls = await list_templates()
     rows: list[list[InlineKeyboardButton]] = []
     for t in tpls:
-        done = len(_done_episodes(t, await filled_episodes(t["id"])))
+        done = len(_done_episodes(t, set(await episode_statuses(t["id"]))))
         total = t["episodes_count"] - _first_ep(t) + 1
         rows.append([InlineKeyboardButton(
             text=texts.ANIME_BTN.format(name=t["name"], filled=done, count=total),
@@ -160,7 +170,8 @@ async def _template_view(
     total_slots = last - first + 1
     pages = max(1, (total_slots + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, pages - 1))
-    done = _done_episodes(tpl, await filled_episodes(template_id))
+    statuses = await episode_statuses(template_id)
+    done = _done_episodes(tpl, set(statuses))
     wd = tpl["weekday"]
 
     start_ep = first + page * PER_PAGE
@@ -179,10 +190,10 @@ async def _template_view(
         a=start_ep, b=end_ep, d1=d1.strftime("%d.%m"), d2=d2.strftime("%d.%m"),
     )
 
-    # Слоти сторінки — компактні кнопки «✅/⬜ N», по PER_ROW у рядку.
+    # Слоти сторінки — компактні кнопки «✅/⏳/⬜ N», по PER_ROW у рядку.
     buttons = [
         InlineKeyboardButton(
-            text=texts.SLOT_BTN.format(mark="✅" if ep in done else "⬜", n=ep),
+            text=texts.SLOT_BTN.format(mark=_slot_mark(tpl, statuses, ep), n=ep),
             callback_data=f"slot:{template_id}:{ep}",
         )
         for ep in range(start_ep, end_ep + 1)
