@@ -110,6 +110,14 @@ def _firstdate_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _firstday_kb() -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(text=str(i), callback_data=f"tplfd:{i}") for i in range(1, 5)]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
+    ])
+
+
 def _yesno_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -463,23 +471,22 @@ async def tpl_has_zero(callback: CallbackQuery, state: FSMContext):
     hz = int(callback.data.split(":")[1])
     await state.update_data(has_zero=hz)
     await state.set_state(TplFSM.firstday)
-    await _edit_cb(callback, texts.TPL_ASK_FIRSTDAY, _cancel_kb())
+    await _edit_cb(callback, texts.TPL_ASK_FIRSTDAY, _firstday_kb())
+    await callback.answer()
+
+
+@router.callback_query(TplFSM.firstday, F.data.startswith("tplfd:"))
+async def tpl_firstday(callback: CallbackQuery, state: FSMContext):
+    fd = int(callback.data.split(":")[1])
+    await state.update_data(first_day=fd)
+    await state.set_state(TplFSM.name)
+    await _edit_cb(callback, texts.TPL_ASK_NAME, _cancel_kb())
     await callback.answer()
 
 
 @router.message(TplFSM.firstday)
-async def tpl_firstday(message: Message, state: FSMContext):
-    raw = (message.text or "").strip()
+async def tpl_firstday_stray(message: Message):
     await _delete(message)
-    data = await state.get_data()
-    if not raw.isdigit() or not (1 <= int(raw) <= MAX_EPISODES):
-        await _edit_panel(
-            message.bot, data, f"{texts.ERR_BAD_FIRSTDAY}\n\n{texts.TPL_ASK_FIRSTDAY}", _cancel_kb()
-        )
-        return
-    await state.update_data(first_day=int(raw))
-    await state.set_state(TplFSM.name)
-    await _edit_panel(message.bot, data, texts.TPL_ASK_NAME, _cancel_kb())
 
 
 @router.message(TplFSM.name)
