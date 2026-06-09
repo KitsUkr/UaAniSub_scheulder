@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -94,6 +95,10 @@ class TplFSM(StatesGroup):
 
 class SlotFSM(StatesGroup):
     collect = State()  # один крок: приймаємо превʼю + MP4 + MKV у будь-якому порядку
+
+
+class ImportFSM(StatesGroup):
+    collect = State()  # приймаємо переслані повідомлення гілки, групуємо по 3
 
 
 # ── Клавіатури ────────────────────────────────────────────────────────────────
@@ -228,6 +233,7 @@ async def _template_view(
             InlineKeyboardButton(text="›" if page < pages - 1 else " ", callback_data=next_cb),
         ])
 
+    rows.append([InlineKeyboardButton(text=texts.BTN_IMPORT, callback_data=f"import:{template_id}")])
     rows.append([InlineKeyboardButton(text=texts.BTN_DELETE_ANIME, callback_data=f"anime_del:{template_id}")])
     rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data="anime_list")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -789,3 +795,197 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
         text, kb = await _anime_list_view()
     await _edit_cb(callback, text, kb)
     await callback.answer()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   Масовий імпорт серій (пересиланням з гілки супергрупи-сховища)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _import_kb(has_items: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_items:
+        rows.append([InlineKeyboardButton(text=texts.BTN_IMPORT_LAYOUT, callback_data="import_layout")])
+        rows.append([InlineKeyboardButton(text=texts.BTN_IMPORT_RESET, callback_data="import_reset")])
+    rows.append([InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _empty_slots(tpl: dict, occupied: set[int]) -> list[int]:
+    """Вільні слоти серій по порядку: ті, що не зайняті релізом і не викладені вручну."""
+    first = _first_ep(tpl)
+    last = tpl["episodes_count"]
+    return [ep for ep in range(first, last + 1) if ep not in occupied]
+
+
+def _build_episodes(items: list[dict]) -> tuple[list[dict] | None, int]:
+    """Ріже відсортований буфер на трійки й розкладає кожну за типом.
+    Повертає (список_епізодів, 0) або (None, номер_проблемної_трійки 1-based).
+    Усередині трійки порядок не важливий — беремо по ролі."""
+    episodes: list[dict] = []
+    for i in range(0, len(items), 3):
+        chunk = items[i:i + 3]
+        by_role: dict[str, dict] = {}
+        for it in chunk:
+            by_role.setdefault(it["role"], it)
+        if not ({"preview", "mp4", "mkv"} <= set(by_role)):
+            return None, i // 3 + 1
+        prev, mp4, mkv = by_role["preview"], by_role["mp4"], by_role["mkv"]
+        episodes.append({
+            "preview_file_id": prev["file_id"],
+            "caption_html": prev.get("caption_html"),
+            "mp4_file_id": mp4["file_id"],
+            "mp4_kind": mp4["kind"],
+            "mp4_caption_html": mp4.get("caption_html"),
+            "mkv_file_id": mkv["file_id"],
+            "mkv_kind": mkv["kind"],
+        })
+    return episodes, 0
+
+
+@router.callback_query(F.data.startswith("import:"))
+async def cb_import_start(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    tpl = await get_template(tid)
+    if not tpl:
+        text, kb = await _anime_list_view()
+        await _edit_cb(callback, text, kb)
+        await callback.answer()
+        return
+    await state.clear()
+    await state.set_state(ImportFSM.collect)
+    await state.update_data(
+        panel_chat=callback.message.chat.id, panel_msg=callback.message.message_id,
+        template_id=tid, items=[], last_panel_ts=0.0,
+    )
+    await _edit_cb(callback, texts.IMPORT_PROMPT, _import_kb(has_items=False))
+    await callback.answer()
+
+
+@router.message(ImportFSM.collect)
+async def import_collect(message: Message, state: FSMContext):
+    """Приймає переслані повідомлення гілки (превʼю/MP4/MKV) у буфер.
+    Сторонні повідомлення тихо ігноруємо — щоб не засмічувати панель."""
+    res = _classify(message)
+    cap_html = message.html_text if (res and message.caption) else None
+    msg_id = message.message_id
+    await _delete(message)
+    if res is None:
+        return
+    role, fid, kind = res
+    # Лок: пересилання десятків повідомлень = багато паралельних update'ів,
+    # read-modify-write буфера має бути атомарним.
+    async with _files_lock:
+        data = await state.get_data()
+        items = list(data.get("items") or [])
+        items.append({
+            "message_id": msg_id, "role": role, "file_id": fid,
+            "kind": kind, "caption_html": cap_html,
+        })
+        await state.update_data(items=items)
+        # Троттлимо оновлення панелі (≤1/сек), щоб не впертися в ліміти Telegram.
+        now = time.monotonic()
+        if now - float(data.get("last_panel_ts") or 0.0) >= 1.0:
+            await state.update_data(last_panel_ts=now)
+            n = len(items)
+            await _edit_panel(
+                message.bot, data,
+                texts.IMPORT_PROGRESS.format(n=n, eps=n // 3),
+                _import_kb(has_items=True),
+            )
+
+
+@router.callback_query(ImportFSM.collect, F.data == "import_reset")
+async def cb_import_reset(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(items=[], last_panel_ts=0.0, plan_episodes=[], plan_slots=[])
+    await _edit_cb(callback, texts.IMPORT_PROMPT, _import_kb(has_items=False))
+    await callback.answer()
+
+
+@router.callback_query(ImportFSM.collect, F.data == "import_layout")
+async def cb_import_layout(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tid = data["template_id"]
+    items = sorted(data.get("items") or [], key=lambda x: x["message_id"])
+
+    if not items:
+        await callback.answer(texts.ERR_IMPORT_EMPTY, show_alert=True)
+        return
+    if len(items) % 3 != 0:
+        await _edit_cb(
+            callback, texts.ERR_IMPORT_NOT_TRIPLE.format(count=len(items)), _import_kb(True)
+        )
+        await callback.answer()
+        return
+
+    episodes, bad = _build_episodes(items)
+    if episodes is None:
+        await _edit_cb(callback, texts.ERR_IMPORT_BAD_GROUP.format(g=bad), _import_kb(True))
+        await callback.answer()
+        return
+
+    tpl = await get_template(tid)
+    if not tpl:
+        await state.clear()
+        text, kb = await _anime_list_view()
+        await _edit_cb(callback, text, kb)
+        await callback.answer()
+        return
+
+    occupied = _done_episodes(tpl, set(await episode_statuses(tid)))
+    empty = _empty_slots(tpl, occupied)
+    if not empty:
+        await callback.answer(texts.ERR_IMPORT_NO_SLOTS, show_alert=True)
+        return
+
+    k = min(len(episodes), len(empty))
+    target_slots = empty[:k]
+    overflow = len(episodes) - k
+    await state.update_data(plan_episodes=episodes[:k], plan_slots=target_slots)
+
+    a, b = target_slots[0], target_slots[-1]
+    d1 = _slot_date(tpl, a).strftime("%d.%m.%Y")
+    d2 = _slot_date(tpl, b).strftime("%d.%m.%Y")
+    overflow_line = texts.WARN_IMPORT_OVERFLOW.format(extra=overflow) if overflow else ""
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=texts.BTN_IMPORT_CONFIRM, callback_data="import_confirm")],
+        [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
+    ])
+    await _edit_cb(callback, texts.IMPORT_CONFIRM.format(
+        name=html.escape(tpl["name"]), count=k, a=a, b=b, d1=d1, d2=d2, overflow=overflow_line,
+    ), kb)
+    await callback.answer()
+
+
+@router.callback_query(ImportFSM.collect, F.data == "import_confirm")
+async def cb_import_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tid = data.get("template_id")
+    episodes = data.get("plan_episodes") or []
+    slots = data.get("plan_slots") or []
+    tpl = await get_template(tid) if tid else None
+    if not tpl or not episodes or not slots:
+        await state.clear()
+        text, kb = await _anime_list_view()
+        await _edit_cb(callback, text, kb)
+        await callback.answer()
+        return
+
+    created = 0
+    for ep_data, ep_no in zip(episodes, slots):
+        await create_release(
+            preview_file_id=ep_data["preview_file_id"],
+            caption_html=ep_data.get("caption_html"),
+            mp4_file_id=ep_data["mp4_file_id"], mp4_kind=ep_data["mp4_kind"],
+            mp4_caption_html=ep_data.get("mp4_caption_html"),
+            mkv_file_id=ep_data["mkv_file_id"], mkv_kind=ep_data["mkv_kind"],
+            run_at=_slot_run_at(tpl, ep_no),
+            template_id=tid, episode_no=ep_no,
+        )
+        created += 1
+
+    await state.clear()
+    text, kb = await _template_view(tid)
+    await _edit_cb(callback, text, kb)
+    await callback.answer(texts.IMPORT_DONE_TOAST.format(count=created))
+    logger.info("Імпортовано %d серій у аніме #%s (слоти %s)", created, tid, slots)
