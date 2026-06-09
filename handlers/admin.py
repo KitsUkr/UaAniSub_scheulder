@@ -39,6 +39,7 @@ router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 _KYIV = ZoneInfo(TZ)
 _TAG_RE = re.compile(r"<[^>]+>")
 MAX_EPISODES = 50
+COUNT_PRESETS = (12, 24, 48)  # стандартні к-сті серій (1/2/4 кури) — кнопками
 PER_ROW = 6        # кнопок-слотів у рядку
 PER_PAGE = 12      # слотів на сторінці (2 ряди по 6)
 
@@ -112,6 +113,14 @@ def _firstdate_kb() -> InlineKeyboardMarkup:
 
 def _firstday_kb() -> InlineKeyboardMarkup:
     row = [InlineKeyboardButton(text=str(i), callback_data=f"tplfd:{i}") for i in range(1, 5)]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
+    ])
+
+
+def _count_kb() -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(text=str(n), callback_data=f"tplc:{n}") for n in COUNT_PRESETS]
     return InlineKeyboardMarkup(inline_keyboard=[
         row,
         [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
@@ -499,7 +508,16 @@ async def tpl_name(message: Message, state: FSMContext):
         return
     await state.update_data(name=name)
     await state.set_state(TplFSM.count)
-    await _edit_panel(message.bot, data, texts.TPL_ASK_COUNT, _cancel_kb())
+    await _edit_panel(message.bot, data, texts.TPL_ASK_COUNT, _count_kb())
+
+
+@router.callback_query(TplFSM.count, F.data.startswith("tplc:"))
+async def tpl_count_preset(callback: CallbackQuery, state: FSMContext):
+    cnt = int(callback.data.split(":")[1])
+    await state.update_data(count=cnt)
+    await state.set_state(TplFSM.weekday)
+    await _edit_cb(callback, texts.TPL_ASK_WEEKDAY, _weekday_kb())
+    await callback.answer()
 
 
 @router.message(TplFSM.count)
@@ -509,7 +527,7 @@ async def tpl_count(message: Message, state: FSMContext):
     data = await state.get_data()
     if not raw.isdigit() or not (1 <= int(raw) <= MAX_EPISODES):
         await _edit_panel(
-            message.bot, data, f"{texts.ERR_BAD_COUNT}\n\n{texts.TPL_ASK_COUNT}", _cancel_kb()
+            message.bot, data, f"{texts.ERR_BAD_COUNT}\n\n{texts.TPL_ASK_COUNT}", _count_kb()
         )
         return
     await state.update_data(count=int(raw))
