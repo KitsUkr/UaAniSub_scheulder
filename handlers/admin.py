@@ -111,10 +111,8 @@ def _yesno_kb() -> InlineKeyboardMarkup:
 
 def _firstdate_prompt(data: dict) -> str:
     wd_name = texts.WEEKDAYS_FULL[data["weekday"]].lower()
-    prompt = texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name)
-    if data.get("has_zero"):
-        prompt += "\n\n" + texts.TPL_FIRSTDATE_ZERO_NOTE
-    return prompt
+    ep_label = texts.EP_LABEL_ZERO if data.get("has_zero") else texts.EP_LABEL_ONE
+    return texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name, ep=ep_label)
 
 
 def _weekday_kb() -> InlineKeyboardMarkup:
@@ -175,8 +173,8 @@ async def _template_view(
         time=tpl["send_time"],
         filled=len(done),
     )
-    d1 = start_date + timedelta(days=7 * (start_ep - 1))
-    d2 = start_date + timedelta(days=7 * (end_ep - 1))
+    d1 = start_date + timedelta(days=7 * (start_ep - first))
+    d2 = start_date + timedelta(days=7 * (end_ep - first))
     text += "\n\n" + texts.SLOT_RANGE.format(
         a=start_ep, b=end_ep, d1=d1.strftime("%d.%m"), d2=d2.strftime("%d.%m"),
     )
@@ -246,19 +244,20 @@ def _compute_start_date(weekday: int, send_time: str) -> str:
 
 
 def _slot_run_at(tpl: dict, episode_no: int) -> str:
-    d = date.fromisoformat(tpl["start_date"]) + timedelta(days=7 * (episode_no - 1))
+    # start_date — дата ПЕРШОЇ серії (нульової, якщо є; інакше 1-ї).
+    d = date.fromisoformat(tpl["start_date"]) + timedelta(days=7 * (episode_no - _first_ep(tpl)))
     return f"{d.isoformat()} {tpl['send_time']}"
 
 
 def _past_episodes(start_date_iso: str, first_ep: int, last_ep: int) -> int:
     """Скільки перших серій уже мали б вийти (їх дата раніше за сьогодні, Київ).
-    Дата серії e = start_date + 7*(e-1) (start_date — дата серії 1, нульова — на
-    тиждень раніше). Використовується для авто-позначки «викладено вручну»."""
+    start_date — дата першої серії (first_ep); дата серії e = start + 7*(e-first_ep).
+    Використовується для авто-позначки «викладено вручну»."""
     start = date.fromisoformat(start_date_iso)
     today = datetime.now(_KYIV).date()
     n = 0
     for e in range(first_ep, last_ep + 1):
-        if start + timedelta(days=7 * (e - 1)) < today:
+        if start + timedelta(days=7 * (e - first_ep)) < today:
             n += 1
         else:
             break
