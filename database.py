@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS templates (
     manual_done     INTEGER NOT NULL DEFAULT 1, -- скільки перших серій уже викладено вручну
     has_zero        INTEGER NOT NULL DEFAULT 0, -- чи є нульова серія (відлік з 0)
     first_day       INTEGER NOT NULL DEFAULT 1, -- скільки серій виходить у перший день
+    repost_channel  TEXT,                       -- партнерський канал для репосту MP4 (NULL = пряма публікація)
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -97,6 +98,8 @@ async def _migrate() -> None:
         await _conn().execute(
             "ALTER TABLE templates ADD COLUMN first_day INTEGER NOT NULL DEFAULT 1"
         )
+    if "repost_channel" not in tcols:
+        await _conn().execute("ALTER TABLE templates ADD COLUMN repost_channel TEXT")
     # Індекс по слоту створюємо тут — після того, як колонки гарантовано є
     # (на старій БД їх ще не було під час executescript).
     await _conn().execute(
@@ -148,7 +151,7 @@ async def create_template(
 async def list_templates() -> list[dict]:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day, repost_channel
         FROM templates
         ORDER BY created_at
         """,
@@ -159,13 +162,22 @@ async def list_templates() -> list[dict]:
 async def get_template(template_id: int) -> dict | None:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day, repost_channel
         FROM templates WHERE id = ?
         """,
         (template_id,),
     )
     row = await cur.fetchone()
     return dict(row) if row else None
+
+
+async def set_repost_channel(template_id: int, channel: str | None) -> None:
+    """Партнерський канал для репосту MP4 (NULL — вимкнути, пряма публікація)."""
+    await _conn().execute(
+        "UPDATE templates SET repost_channel = ? WHERE id = ?",
+        (channel, template_id),
+    )
+    await _conn().commit()
 
 
 async def delete_template(template_id: int) -> bool:
@@ -255,11 +267,12 @@ async def due_releases(now_str: str) -> list[dict]:
     """
     cur = await _conn().execute(
         """
-        SELECT id, preview_file_id, caption_html,
-               mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at
-        FROM releases
-        WHERE status = 'pending' AND run_at <= ?
-        ORDER BY run_at
+        SELECT r.id, r.preview_file_id, r.caption_html,
+               r.mp4_file_id, r.mp4_kind, r.mp4_caption_html, r.mkv_file_id, r.mkv_kind, r.run_at,
+               t.repost_channel
+        FROM releases r LEFT JOIN templates t ON t.id = r.template_id
+        WHERE r.status = 'pending' AND r.run_at <= ?
+        ORDER BY r.run_at
         """,
         (now_str,),
     )

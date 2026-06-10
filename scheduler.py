@@ -52,22 +52,43 @@ async def _send_with_emoji_fallback(send, caption: str | None):
         return await send(stripped)
 
 
-async def _send_media(bot: Bot, file_id: str, kind: str, caption: str | None = None):
+def _chat(value: str) -> int | str:
+    """'-100…' з БД → int для Bot API; '@username' лишається рядком."""
+    return int(value) if value.lstrip("-").isdigit() else value
+
+
+async def _send_media(
+    bot: Bot, file_id: str, kind: str, channel: int | str, caption: str | None = None
+):
 
     async def _do(cap: str | None):
         if kind == "video":
             return await bot.send_video(
-                RELEASE_CHANNEL, file_id, caption=cap, supports_streaming=True
+                channel, file_id, caption=cap, supports_streaming=True
             )
-        return await bot.send_document(RELEASE_CHANNEL, file_id, caption=cap)
+        return await bot.send_document(channel, file_id, caption=cap)
 
     return await _send_with_emoji_fallback(_do, caption)
 
 
 async def _publish_one(bot: Bot, r: dict) -> None:
     # Послідовні await гарантують порядок: MP4 → MKV → превʼю.
-    mp4_msg = await _send_media(bot, r["mp4_file_id"], r["mp4_kind"], r.get("mp4_caption_html"))
-    mkv_msg = await _send_media(bot, r["mkv_file_id"], r["mkv_kind"])
+    repost_channel = r.get("repost_channel")
+    if repost_channel:
+        # MP4 виходить у партнерському каналі, у release-канал іде його репост —
+        # посилання «Переглянути» веде саме на репост.
+        src = await _send_media(
+            bot, r["mp4_file_id"], r["mp4_kind"], _chat(repost_channel),
+            r.get("mp4_caption_html"),
+        )
+        mp4_msg = await bot.forward_message(
+            RELEASE_CHANNEL, from_chat_id=src.chat.id, message_id=src.message_id
+        )
+    else:
+        mp4_msg = await _send_media(
+            bot, r["mp4_file_id"], r["mp4_kind"], RELEASE_CHANNEL, r.get("mp4_caption_html")
+        )
+    mkv_msg = await _send_media(bot, r["mkv_file_id"], r["mkv_kind"], RELEASE_CHANNEL)
 
     watch = _msg_link(RELEASE_CHANNEL, mp4_msg.message_id)
     download = _msg_link(RELEASE_CHANNEL, mkv_msg.message_id)

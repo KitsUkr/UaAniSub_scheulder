@@ -28,6 +28,7 @@ from database import (
     get_release_by_slot,
     get_template,
     list_templates,
+    set_repost_channel,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,10 @@ class SlotFSM(StatesGroup):
 
 class ImportFSM(StatesGroup):
     collect = State()  # приймаємо переслані повідомлення гілки, групуємо по 3
+
+
+class RepostFSM(StatesGroup):
+    channel = State()  # очікуємо @username або ID партнерського каналу
 
 
 # ── Клавіатури ────────────────────────────────────────────────────────────────
@@ -233,7 +238,10 @@ async def _template_view(
             InlineKeyboardButton(text="›" if page < pages - 1 else " ", callback_data=next_cb),
         ])
 
-    rows.append([InlineKeyboardButton(text=texts.BTN_IMPORT, callback_data=f"import:{template_id}")])
+    rows.append([
+        InlineKeyboardButton(text=texts.BTN_IMPORT, callback_data=f"import:{template_id}"),
+        InlineKeyboardButton(text=texts.BTN_REPOST, callback_data=f"repost:{template_id}"),
+    ])
     rows.append([InlineKeyboardButton(text=texts.BTN_DELETE_ANIME, callback_data=f"anime_del:{template_id}")])
     rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data="anime_list")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -989,3 +997,99 @@ async def cb_import_confirm(callback: CallbackQuery, state: FSMContext):
     await _edit_cb(callback, text, kb)
     await callback.answer(texts.IMPORT_DONE_TOAST.format(count=created))
     logger.info("Імпортовано %d серій у аніме #%s (слоти %s)", created, tid, slots)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   Репост з партнерського каналу
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_channel(raw: str) -> int | str | None:
+    """@username або ID (-100…) → значення для Bot API; None, якщо не схоже на канал."""
+    raw = (raw or "").strip()
+    if raw.startswith("@") and len(raw) > 1 and " " not in raw:
+        return raw
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return None
+
+
+def _repost_prompt(tpl: dict) -> str:
+    channel = tpl.get("repost_channel")
+    current = (
+        texts.REPOST_CURRENT_ON.format(channel=html.escape(str(channel)))
+        if channel else texts.REPOST_CURRENT_OFF
+    )
+    return texts.REPOST_PROMPT.format(current=current)
+
+
+def _repost_kb(template_id: int, has_channel: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_channel:
+        rows.append([InlineKeyboardButton(
+            text=texts.BTN_REPOST_OFF, callback_data=f"repost_off:{template_id}",
+        )])
+    rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anime:{template_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("repost:"))
+async def cb_repost_start(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    tpl = await get_template(tid)
+    if not tpl:
+        text, kb = await _anime_list_view()
+        await _edit_cb(callback, text, kb)
+        await callback.answer()
+        return
+    await state.clear()
+    await state.set_state(RepostFSM.channel)
+    await state.update_data(
+        panel_chat=callback.message.chat.id, panel_msg=callback.message.message_id,
+        template_id=tid,
+    )
+    await _edit_cb(callback, _repost_prompt(tpl), _repost_kb(tid, bool(tpl.get("repost_channel"))))
+    await callback.answer()
+
+
+@router.message(RepostFSM.channel)
+async def repost_channel_input(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    await _delete(message)
+    data = await state.get_data()
+    tid = data["template_id"]
+    tpl = await get_template(tid)
+    if not tpl:
+        await state.clear()
+        return
+
+    channel = _parse_channel(raw)
+    if channel is not None:
+        try:
+            await message.bot.get_chat(channel)
+        except Exception:
+            channel = None
+    if channel is None:
+        await _edit_panel(
+            message.bot, data,
+            texts.ERR_REPOST_CHANNEL + "\n\n" + _repost_prompt(tpl),
+            _repost_kb(tid, bool(tpl.get("repost_channel"))),
+        )
+        return
+
+    await set_repost_channel(tid, str(channel))
+    await state.clear()
+    text, kb = await _template_view(tid)
+    await _edit_panel(message.bot, data, text, kb)
+    logger.info("Аніме #%d: репост через канал %s", tid, channel)
+
+
+@router.callback_query(F.data.startswith("repost_off:"))
+async def cb_repost_off(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    await set_repost_channel(tid, None)
+    await state.clear()
+    text, kb = await _template_view(tid)
+    if text is None:
+        text, kb = await _anime_list_view()
+    await _edit_cb(callback, text, kb)
+    await callback.answer(texts.REPOST_OFF_TOAST)
