@@ -226,6 +226,26 @@ async def create_release(
     return cur.lastrowid
 
 
+async def create_releases_bulk(releases: list[dict]) -> None:
+    """Створює багато релізів однією транзакцією (один commit замість N) —
+    масовий імпорт атомарний: або всі серії, або жодної.
+    Ключі словників — як іменовані аргументи create_release."""
+    await _conn().executemany(
+        """
+        INSERT INTO releases (
+            preview_file_id, caption_html,
+            mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at,
+            template_id, episode_no
+        )
+        VALUES (:preview_file_id, :caption_html, :mp4_file_id, :mp4_kind,
+                :mp4_caption_html, :mkv_file_id, :mkv_kind, :run_at,
+                :template_id, :episode_no)
+        """,
+        releases,
+    )
+    await _conn().commit()
+
+
 async def episode_statuses(template_id: int) -> dict[int, str]:
     """Останній статус релізу для кожної серії шаблону: episode_no → status
     ('pending' — заплановано ⏳, 'sent' — опубліковано ✅, 'failed').

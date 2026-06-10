@@ -22,6 +22,7 @@ from config import ADMIN_IDS, TZ
 from database import (
     cancel_release,
     create_release,
+    create_releases_bulk,
     create_template,
     delete_template,
     episode_statuses,
@@ -979,18 +980,19 @@ async def cb_import_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    created = 0
-    for ep_data, ep_no in zip(episodes, slots):
-        await create_release(
-            preview_file_id=ep_data["preview_file_id"],
-            caption_html=ep_data.get("caption_html"),
-            mp4_file_id=ep_data["mp4_file_id"], mp4_kind=ep_data["mp4_kind"],
-            mp4_caption_html=ep_data.get("mp4_caption_html"),
-            mkv_file_id=ep_data["mkv_file_id"], mkv_kind=ep_data["mkv_kind"],
-            run_at=_slot_run_at(tpl, ep_no),
-            template_id=tid, episode_no=ep_no,
-        )
-        created += 1
+    await create_releases_bulk([
+        {
+            "preview_file_id": ep_data["preview_file_id"],
+            "caption_html": ep_data.get("caption_html"),
+            "mp4_file_id": ep_data["mp4_file_id"], "mp4_kind": ep_data["mp4_kind"],
+            "mp4_caption_html": ep_data.get("mp4_caption_html"),
+            "mkv_file_id": ep_data["mkv_file_id"], "mkv_kind": ep_data["mkv_kind"],
+            "run_at": _slot_run_at(tpl, ep_no),
+            "template_id": tid, "episode_no": ep_no,
+        }
+        for ep_data, ep_no in zip(episodes, slots)
+    ])
+    created = len(slots)
 
     await state.clear()
     text, kb = await _template_view(tid)
