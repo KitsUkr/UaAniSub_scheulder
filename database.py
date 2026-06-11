@@ -9,12 +9,22 @@
 
 import logging
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from config import DB_PATH
+from config import DB_PATH, TZ
 
 logger = logging.getLogger(__name__)
+
+_KYIV = ZoneInfo(TZ)
+
+
+def _now() -> str:
+    """Поточний київський час — у БД всі мітки (run_at, created_at, sent_at)
+    в одному поясі, інакше datetime('now') писав би UTC."""
+    return datetime.now(_KYIV).strftime("%Y-%m-%d %H:%M:%S")
 
 _db: aiosqlite.Connection | None = None
 
@@ -45,7 +55,10 @@ CREATE TABLE IF NOT EXISTS releases (
     mkv_kind        TEXT NOT NULL,
     run_at          TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
-    template_id     INTEGER,
+    mp4_msg_id      INTEGER,                    -- id поста MP4 у release-каналі (вже відправлено)
+    mkv_msg_id      INTEGER,                    -- id поста MKV у release-каналі (вже відправлено)
+    -- При видаленні шаблону опубліковані релізи лишаються в історії без привʼязки.
+    template_id     INTEGER REFERENCES templates(id) ON DELETE SET NULL,
     episode_no      INTEGER,
     created_at      TEXT DEFAULT (datetime('now')),
     sent_at         TEXT
@@ -53,6 +66,13 @@ CREATE TABLE IF NOT EXISTS releases (
 
 CREATE INDEX IF NOT EXISTS idx_releases_due
     ON releases (status, run_at);
+
+-- Стан FSM aiogram (майстри створення/заповнення/імпорту) — переживає рестарт.
+CREATE TABLE IF NOT EXISTS fsm (
+    key   TEXT PRIMARY KEY,             -- bot_id:chat_id:user_id
+    state TEXT,
+    data  TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 
@@ -67,6 +87,9 @@ async def init_db() -> None:
     _db.row_factory = aiosqlite.Row
     # WAL: читання не блокується записом + краща стійкість до збоїв.
     await _db.execute("PRAGMA journal_mode=WAL")
+    # FK діють для БД, створених із REFERENCES у схемі; старі БД без FK
+    # прибирає вручну delete_template — поведінка та сама.
+    await _db.execute("PRAGMA foreign_keys=ON")
     await _db.executescript(_SCHEMA)
     await _db.commit()
     await _migrate()
@@ -80,6 +103,8 @@ async def _migrate() -> None:
         ("template_id", "INTEGER"),
         ("episode_no", "INTEGER"),
         ("mp4_caption_html", "TEXT"),
+        ("mp4_msg_id", "INTEGER"),
+        ("mkv_msg_id", "INTEGER"),
     ):
         if col not in cols:
             await _conn().execute(f"ALTER TABLE releases ADD COLUMN {col} {decl}")
@@ -138,11 +163,11 @@ async def create_template(
         """
         INSERT INTO templates
             (name, weekday, send_time, episodes_count, start_date,
-             manual_done, has_zero, first_day)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             manual_done, has_zero, first_day, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (name, weekday, send_time, episodes_count, start_date,
-         manual_done, has_zero, first_day),
+         manual_done, has_zero, first_day, _now()),
     )
     await _conn().commit()
     return cur.lastrowid
@@ -212,14 +237,14 @@ async def create_release(
         INSERT INTO releases (
             preview_file_id, caption_html,
             mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at,
-            template_id, episode_no
+            template_id, episode_no, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             preview_file_id, caption_html,
             mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at,
-            template_id, episode_no,
+            template_id, episode_no, _now(),
         ),
     )
     await _conn().commit()
@@ -230,18 +255,19 @@ async def create_releases_bulk(releases: list[dict]) -> None:
     """Створює багато релізів однією транзакцією (один commit замість N) —
     масовий імпорт атомарний: або всі серії, або жодної.
     Ключі словників — як іменовані аргументи create_release."""
+    now = _now()
     await _conn().executemany(
         """
         INSERT INTO releases (
             preview_file_id, caption_html,
             mp4_file_id, mp4_kind, mp4_caption_html, mkv_file_id, mkv_kind, run_at,
-            template_id, episode_no
+            template_id, episode_no, created_at
         )
         VALUES (:preview_file_id, :caption_html, :mp4_file_id, :mp4_kind,
                 :mp4_caption_html, :mkv_file_id, :mkv_kind, :run_at,
-                :template_id, :episode_no)
+                :template_id, :episode_no, :created_at)
         """,
-        releases,
+        [{**r, "created_at": now} for r in releases],
     )
     await _conn().commit()
 
@@ -265,6 +291,26 @@ async def episode_statuses(template_id: int) -> dict[int, str]:
     return {row["episode_no"]: row["status"] for row in await cur.fetchall()}
 
 
+async def episode_statuses_all() -> dict[int, dict[int, str]]:
+    """Як episode_statuses, але для всіх шаблонів одним запитом:
+    template_id → {episode_no → status}. Для списку аніме (без N+1)."""
+    cur = await _conn().execute(
+        """
+        SELECT template_id, episode_no, status
+        FROM releases r
+        WHERE template_id IS NOT NULL AND episode_no IS NOT NULL
+          AND id = (
+            SELECT MAX(id) FROM releases
+            WHERE template_id = r.template_id AND episode_no = r.episode_no
+          )
+        """,
+    )
+    result: dict[int, dict[int, str]] = {}
+    for row in await cur.fetchall():
+        result.setdefault(row["template_id"], {})[row["episode_no"]] = row["status"]
+    return result
+
+
 async def get_release_by_slot(template_id: int, episode_no: int) -> dict | None:
     cur = await _conn().execute(
         """
@@ -284,14 +330,17 @@ async def due_releases(now_str: str) -> list[dict]:
 
     Порівняння рядків 'YYYY-MM-DD HH:MM' з нулями зліва = хронологічне.
     `<=` (а не `==`) гарантує, що випуск не загубиться після простою бота.
+    'sending' теж беремо: це випуски, на яких бот упав посеред публікації —
+    msg_id уже відправлених кроків збережені, тож продовжимо без дублів.
     """
     cur = await _conn().execute(
         """
         SELECT r.id, r.preview_file_id, r.caption_html,
                r.mp4_file_id, r.mp4_kind, r.mp4_caption_html, r.mkv_file_id, r.mkv_kind, r.run_at,
+               r.mp4_msg_id, r.mkv_msg_id,
                t.repost_channel
         FROM releases r LEFT JOIN templates t ON t.id = r.template_id
-        WHERE r.status = 'pending' AND r.run_at <= ?
+        WHERE r.status IN ('pending', 'sending') AND r.run_at <= ?
         ORDER BY r.run_at
         """,
         (now_str,),
@@ -300,10 +349,38 @@ async def due_releases(now_str: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def mark_sending(release_id: int) -> None:
+    """Позначає випуск як «публікується» — щоб після падіння посеред публікації
+    було видно, що частина кроків могла вже піти в канали."""
+    await _conn().execute(
+        "UPDATE releases SET status = 'sending' WHERE id = ?",
+        (release_id,),
+    )
+    await _conn().commit()
+
+
+async def save_mp4_msg_id(release_id: int, message_id: int) -> None:
+    """Фіксує id уже відправленого поста MP4 — при повторі цей крок пропускається."""
+    await _conn().execute(
+        "UPDATE releases SET mp4_msg_id = ? WHERE id = ?",
+        (message_id, release_id),
+    )
+    await _conn().commit()
+
+
+async def save_mkv_msg_id(release_id: int, message_id: int) -> None:
+    """Фіксує id уже відправленого поста MKV — при повторі цей крок пропускається."""
+    await _conn().execute(
+        "UPDATE releases SET mkv_msg_id = ? WHERE id = ?",
+        (message_id, release_id),
+    )
+    await _conn().commit()
+
+
 async def mark_sent(release_id: int) -> None:
     await _conn().execute(
-        "UPDATE releases SET status = 'sent', sent_at = datetime('now') WHERE id = ?",
-        (release_id,),
+        "UPDATE releases SET status = 'sent', sent_at = ? WHERE id = ?",
+        (_now(), release_id),
     )
     await _conn().commit()
 
@@ -314,6 +391,17 @@ async def mark_failed(release_id: int) -> None:
         (release_id,),
     )
     await _conn().commit()
+
+
+async def retry_release(release_id: int) -> bool:
+    """Повертає провалений (failed) випуск у чергу: status → pending.
+    run_at уже в минулому, тож планувальник підхопить його на найближчій хвилині."""
+    cur = await _conn().execute(
+        "UPDATE releases SET status = 'pending' WHERE id = ? AND status = 'failed'",
+        (release_id,),
+    )
+    await _conn().commit()
+    return cur.rowcount > 0
 
 
 async def cancel_release(release_id: int) -> bool:

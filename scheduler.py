@@ -19,7 +19,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import texts
 from caption import render_caption
 from config import ADMIN_IDS, PREVIEW_CHANNEL, RELEASE_CHANNEL, TZ
-from database import due_releases, mark_failed, mark_sent
+from database import (
+    due_releases,
+    mark_failed,
+    mark_sending,
+    mark_sent,
+    save_mkv_msg_id,
+    save_mp4_msg_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +35,13 @@ _DT_FMT = "%Y-%m-%d %H:%M"
 
 
 def _msg_link(channel: str, message_id: int) -> str:
-    return f"https://t.me/{channel.lstrip('@')}/{message_id}"
+    """Посилання на пост: t.me/<username>/<id> для публічних каналів,
+    t.me/c/<internal_id>/<id> — для приватних, заданих числовим ID (-100…)."""
+    chan = str(channel)
+    if chan.lstrip("-").isdigit():
+        internal = chan[4:] if chan.startswith("-100") else chan.lstrip("-")
+        return f"https://t.me/c/{internal}/{message_id}"
+    return f"https://t.me/{chan.lstrip('@')}/{message_id}"
 
 _TG_EMOJI_RE = re.compile(r"<tg-emoji\b[^>]*>(.*?)</tg-emoji>", re.IGNORECASE | re.DOTALL)
 
@@ -73,25 +86,37 @@ async def _send_media(
 
 async def _publish_one(bot: Bot, r: dict) -> None:
     # Послідовні await гарантують порядок: MP4 → MKV → превʼю.
+    # Кожен відправлений крок фіксується в БД (msg_id) — якщо бот упав посеред
+    # публікації, на повторі вже відправлені пости не дублюються.
     repost_channel = r.get("repost_channel")
-    if repost_channel:
-        # MP4 виходить у партнерському каналі, у release-канал іде його репост —
-        # посилання «Переглянути» веде саме на репост.
-        src = await _send_media(
-            bot, r["mp4_file_id"], r["mp4_kind"], _chat(repost_channel),
-            r.get("mp4_caption_html"),
-        )
-        mp4_msg = await bot.forward_message(
-            RELEASE_CHANNEL, from_chat_id=src.chat.id, message_id=src.message_id
-        )
-    else:
-        mp4_msg = await _send_media(
-            bot, r["mp4_file_id"], r["mp4_kind"], RELEASE_CHANNEL, r.get("mp4_caption_html")
-        )
-    mkv_msg = await _send_media(bot, r["mkv_file_id"], r["mkv_kind"], RELEASE_CHANNEL)
 
-    watch = _msg_link(RELEASE_CHANNEL, mp4_msg.message_id)
-    download = _msg_link(RELEASE_CHANNEL, mkv_msg.message_id)
+    mp4_msg_id = r.get("mp4_msg_id")
+    if not mp4_msg_id:
+        if repost_channel:
+            # MP4 виходить у партнерському каналі, у release-канал іде його репост —
+            # посилання «Переглянути» веде саме на репост.
+            src = await _send_media(
+                bot, r["mp4_file_id"], r["mp4_kind"], _chat(repost_channel),
+                r.get("mp4_caption_html"),
+            )
+            mp4_msg = await bot.forward_message(
+                RELEASE_CHANNEL, from_chat_id=src.chat.id, message_id=src.message_id
+            )
+        else:
+            mp4_msg = await _send_media(
+                bot, r["mp4_file_id"], r["mp4_kind"], RELEASE_CHANNEL, r.get("mp4_caption_html")
+            )
+        mp4_msg_id = mp4_msg.message_id
+        await save_mp4_msg_id(r["id"], mp4_msg_id)
+
+    mkv_msg_id = r.get("mkv_msg_id")
+    if not mkv_msg_id:
+        mkv_msg = await _send_media(bot, r["mkv_file_id"], r["mkv_kind"], RELEASE_CHANNEL)
+        mkv_msg_id = mkv_msg.message_id
+        await save_mkv_msg_id(r["id"], mkv_msg_id)
+
+    watch = _msg_link(RELEASE_CHANNEL, mp4_msg_id)
+    download = _msg_link(RELEASE_CHANNEL, mkv_msg_id)
     caption = render_caption(r["caption_html"], watch, download)
 
     await _send_with_emoji_fallback(
@@ -120,6 +145,7 @@ async def _publish_due(bot: Bot) -> None:
     logger.info("Публікація: %d випуск(ів) (час %s)", len(rows), now)
     for r in rows:
         try:
+            await mark_sending(r["id"])
             await _publish_one(bot, r)
             await mark_sent(r["id"])
             logger.info("Випуск #%d опубліковано", r["id"])

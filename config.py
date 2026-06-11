@@ -15,11 +15,17 @@ def _require(name: str) -> str:
 
 BOT_TOKEN = _require("BOT_TOKEN")
 
-ADMIN_IDS: list[int] = [
-    int(uid.strip())
-    for uid in _require("ADMIN_IDS").split(",")
-    if uid.strip()
-]
+try:
+    ADMIN_IDS: list[int] = [
+        int(uid.strip())
+        for uid in _require("ADMIN_IDS").split(",")
+        if uid.strip()
+    ]
+except ValueError:
+    sys.exit(
+        "Помилка: ADMIN_IDS має містити числові Telegram ID через кому, "
+        "напр. ADMIN_IDS=123456789,987654321"
+    )
 
 # Канал-вітрина, куди йде превʼю з посиланнями.
 PREVIEW_CHANNEL = _require("PREVIEW_CHANNEL")

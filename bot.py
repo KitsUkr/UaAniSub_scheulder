@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 import scheduler as scheduler_module
 from config import BOT_TOKEN
 from database import close_db, init_db
+from fsm_storage import SQLiteStorage
 from handlers import admin
 
 logging.basicConfig(
@@ -39,7 +40,8 @@ async def main():
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),
     )
-    dp = Dispatcher()
+    # FSM-стан у SQLite — майстри (створення/заповнення/імпорт) переживають рестарт.
+    dp = Dispatcher(storage=SQLiteStorage())
     dp.include_router(admin.router)
 
     sched = scheduler_module.start(bot)

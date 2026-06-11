@@ -3,10 +3,12 @@ import html
 import logging
 import re
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,9 +28,11 @@ from database import (
     create_template,
     delete_template,
     episode_statuses,
+    episode_statuses_all,
     get_release_by_slot,
     get_template,
     list_templates,
+    retry_release,
     set_repost_channel,
 )
 
@@ -48,7 +52,9 @@ PER_PAGE = 12      # слотів на сторінці (2 ряди по 6)
 
 # Серіалізує накопичення файлів слота: альбом приходить кількома update'ами
 # майже одночасно — без локу read-modify-write стану може загубити файл.
-_files_lock = asyncio.Lock()
+# Лок окремий на користувача: стани FSM теж по-користувацькі, тож двом
+# адмінам нема чого чекати один одного.
+_files_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 def _first_ep(tpl: dict) -> int:
@@ -76,10 +82,13 @@ def _is_manual(tpl: dict, ep: int) -> bool:
 
 
 def _slot_mark(tpl: dict, statuses: dict[int, str], ep: int) -> str:
-    """Позначка слота: ⏳ заплановано (pending), ✅ опубліковано (sent/вручну),
-    ⬜ порожньо. Реальний реліз має пріоритет над ручною позначкою."""
+    """Позначка слота: ⏳ заплановано (pending), ❌ публікація провалилася,
+    ✅ опубліковано (sent/вручну), ⬜ порожньо. Реальний реліз має пріоритет
+    над ручною позначкою."""
     if statuses.get(ep) == "pending":
         return "⏳"
+    if statuses.get(ep) == "failed":
+        return "❌"
     if ep in statuses or _is_manual(tpl, ep):
         return "✅"
     return "⬜"
@@ -173,9 +182,10 @@ def _main_menu() -> tuple[str, InlineKeyboardMarkup]:
 
 async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
     tpls = await list_templates()
+    all_statuses = await episode_statuses_all()
     rows: list[list[InlineKeyboardButton]] = []
     for t in tpls:
-        done = len(_done_episodes(t, set(await episode_statuses(t["id"]))))
+        done = len(_done_episodes(t, set(all_statuses.get(t["id"], {}))))
         total = t["episodes_count"] - _first_ep(t) + 1
         rows.append([InlineKeyboardButton(
             text=texts.ANIME_BTN.format(name=t["name"], filled=done, count=total),
@@ -298,6 +308,11 @@ def _slot_run_at(tpl: dict, episode_no: int) -> str:
     return f"{_slot_date(tpl, episode_no).isoformat()} {tpl['send_time']}"
 
 
+def _run_at_passed(run_at: str) -> bool:
+    """Чи минув уже запланований час (порівняння рядків 'YYYY-MM-DD HH:MM')."""
+    return run_at <= datetime.now(_KYIV).strftime("%Y-%m-%d %H:%M")
+
+
 def _past_episodes(start_date_iso: str, first_ep: int, last_ep: int, first_day: int) -> int:
     """Скільки перших серій уже мали б вийти (їх дата раніше за сьогодні, Київ).
     Враховує, що перші first_day серій виходять одного дня (start_date)."""
@@ -353,6 +368,8 @@ def _collect_text(data: dict, note: str | None = None) -> str:
         body += "\n\n" + texts.SLOT_READY.format(
             run_at=data["run_at"], caption=_title(data.get("caption_html")),
         )
+        if _run_at_passed(data["run_at"]):
+            body += "\n\n" + texts.WARN_PAST_RUN
     return body
 
 
@@ -371,11 +388,21 @@ async def _delete(message: Message) -> None:
         pass
 
 
+def _ignorable_edit_error(exc: TelegramBadRequest) -> bool:
+    """Очікувані помилки редагування панелі: текст не змінився або
+    повідомлення вже видалене користувачем — їх безпечно ігнорувати."""
+    msg = str(exc).lower()
+    return "message is not modified" in msg or "message to edit not found" in msg
+
+
 async def _edit_cb(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup | None) -> None:
     try:
         await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    except TelegramBadRequest as exc:
+        if not _ignorable_edit_error(exc):
+            logger.warning("Не вдалося оновити панель: %s", exc)
     except Exception:
-        pass
+        logger.exception("Помилка редагування панелі")
 
 
 async def _edit_panel(bot, data: dict, text: str, kb: InlineKeyboardMarkup | None) -> None:
@@ -387,8 +414,11 @@ async def _edit_panel(bot, data: dict, text: str, kb: InlineKeyboardMarkup | Non
             reply_markup=kb,
             disable_web_page_preview=True,
         )
+    except TelegramBadRequest as exc:
+        if not _ignorable_edit_error(exc):
+            logger.warning("Не вдалося оновити панель: %s", exc)
     except Exception:
-        pass
+        logger.exception("Помилка редагування панелі")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -672,6 +702,19 @@ async def cb_slot(callback: CallbackQuery, state: FSMContext):
         return
     page = _page_of(ep, _first_ep(tpl))
     rel = await get_release_by_slot(tid, ep)
+    if rel and rel["status"] == "failed":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=texts.BTN_RETRY, callback_data=f"sretry:{rel['id']}:{tid}:{ep}")],
+            [InlineKeyboardButton(text=texts.BTN_REPLACE, callback_data=f"screp:{tid}:{ep}")],
+            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anpg:{tid}:{page}")],
+        ])
+        await _edit_cb(
+            callback,
+            texts.SLOT_FAILED.format(n=ep, run_at=rel["run_at"], caption=_title(rel["caption_html"])),
+            kb,
+        )
+        await callback.answer()
+        return
     if rel:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=texts.BTN_REPLACE, callback_data=f"screp:{tid}:{ep}")],
@@ -728,6 +771,22 @@ async def cb_slot_cancelpub(callback: CallbackQuery, state: FSMContext):
     await callback.answer(texts.CANCEL_PUB_TOAST)
 
 
+@router.callback_query(F.data.startswith("sretry:"))
+async def cb_slot_retry(callback: CallbackQuery, state: FSMContext):
+    _, rel_s, tid_s, ep_s = callback.data.split(":")
+    retried = await retry_release(int(rel_s))
+    await state.clear()
+    tpl = await get_template(int(tid_s))
+    page = _page_of(int(ep_s), _first_ep(tpl)) if tpl else 0
+    text, kb = await _template_view(int(tid_s), page)
+    if text is None:
+        text, kb = await _anime_list_view()
+    await _edit_cb(callback, text, kb)
+    await callback.answer(texts.RETRY_TOAST if retried else None)
+    if retried:
+        logger.info("Випуск #%s повернуто в чергу (серія %s аніме #%s)", rel_s, ep_s, tid_s)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #   Майстер заповнення слота
 # ══════════════════════════════════════════════════════════════════════════════
@@ -742,7 +801,7 @@ async def slot_collect(message: Message, state: FSMContext):
     cap_html = message.html_text if (res and message.caption) else None
     await _delete(message)
     # Лок: альбом дає кілька паралельних update'ів — read-modify-write має бути атомарним.
-    async with _files_lock:
+    async with _files_locks[message.from_user.id]:
         data = await state.get_data()
         if res is None:
             await _edit_panel(
@@ -781,6 +840,8 @@ async def cb_slot_schedule(callback: CallbackQuery, state: FSMContext):
     tpl = await get_template(tid)
     page = _page_of(ep, _first_ep(tpl)) if tpl else 0
     text, kb = await _template_view(tid, page)
+    if text is None:
+        text, kb = await _anime_list_view()
     await _edit_cb(callback, text, kb)
     await callback.answer(texts.SCHEDULED_TOAST)
     logger.info("Заплановано серію %s аніме #%s на %s", ep, tid, data["run_at"])
@@ -883,7 +944,7 @@ async def import_collect(message: Message, state: FSMContext):
     role, fid, kind = res
     # Лок: пересилання десятків повідомлень = багато паралельних update'ів,
     # read-modify-write буфера має бути атомарним.
-    async with _files_lock:
+    async with _files_locks[message.from_user.id]:
         data = await state.get_data()
         items = list(data.get("items") or [])
         items.append({
@@ -955,13 +1016,16 @@ async def cb_import_layout(callback: CallbackQuery, state: FSMContext):
     d1 = _slot_date(tpl, a).strftime("%d.%m.%Y")
     d2 = _slot_date(tpl, b).strftime("%d.%m.%Y")
     overflow_line = texts.WARN_IMPORT_OVERFLOW.format(extra=overflow) if overflow else ""
+    past = sum(1 for ep in target_slots if _run_at_passed(_slot_run_at(tpl, ep)))
+    past_line = texts.WARN_IMPORT_PAST.format(n=past) if past else ""
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=texts.BTN_IMPORT_CONFIRM, callback_data="import_confirm")],
         [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
     ])
     await _edit_cb(callback, texts.IMPORT_CONFIRM.format(
-        name=html.escape(tpl["name"]), count=k, a=a, b=b, d1=d1, d2=d2, overflow=overflow_line,
+        name=html.escape(tpl["name"]), count=k, a=a, b=b, d1=d1, d2=d2,
+        overflow=overflow_line, past=past_line,
     ), kb)
     await callback.answer()
 
