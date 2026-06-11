@@ -25,6 +25,7 @@ logging.basicConfig(
         ),
     ],
 )
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
