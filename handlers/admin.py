@@ -34,6 +34,7 @@ from database import (
     list_templates,
     retry_release,
     set_repost_channel,
+    set_send_time,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,10 @@ class RepostFSM(StatesGroup):
     channel = State()  # очікуємо @username або ID партнерського каналу
 
 
+class EditTimeFSM(StatesGroup):
+    time = State()  # очікуємо новий час публікації ГГ:ХХ
+
+
 # ── Клавіатури ────────────────────────────────────────────────────────────────
 
 def _cancel_kb() -> InlineKeyboardMarkup:
@@ -124,11 +129,21 @@ def _cancel_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def _firstdate_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=texts.BTN_SKIP, callback_data="tplskip")],
-        [InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")],
-    ])
+def _firstdate_kb(selected_month: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"• {texts.MONTHS_SHORT[m - 1]} •" if m == selected_month
+                else texts.MONTHS_SHORT[m - 1],
+                callback_data=f"tplmon:{m}",
+            )
+            for m in range(start, start + 4)
+        ]
+        for start in (1, 5, 9)
+    ]
+    rows.append([InlineKeyboardButton(text=texts.BTN_SKIP, callback_data="tplskip")])
+    rows.append([InlineKeyboardButton(text=texts.BTN_CANCEL, callback_data="rel_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _firstday_kb() -> InlineKeyboardMarkup:
@@ -160,7 +175,14 @@ def _yesno_kb() -> InlineKeyboardMarkup:
 def _firstdate_prompt(data: dict) -> str:
     wd_name = texts.WEEKDAYS_FULL[data["weekday"]].lower()
     ep_label = texts.EP_LABEL_ZERO if data.get("has_zero") else texts.EP_LABEL_ONE
-    return texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name, ep=ep_label)
+    year = datetime.now(_KYIV).year
+    text = texts.TPL_ASK_FIRSTDATE.format(weekday=wd_name, ep=ep_label, year=year)
+    month = data.get("fd_month")
+    if month:
+        text += "\n\n" + texts.TPL_FIRSTDATE_MONTH_SET.format(
+            month=texts.MONTHS_FULL[month - 1], year=year,
+        )
+    return text
 
 
 def _weekday_kb() -> InlineKeyboardMarkup:
@@ -252,6 +274,7 @@ async def _template_view(
     rows.append([
         InlineKeyboardButton(text=texts.BTN_IMPORT, callback_data=f"import:{template_id}"),
         InlineKeyboardButton(text=texts.BTN_REPOST, callback_data=f"repost:{template_id}"),
+        InlineKeyboardButton(text=texts.BTN_CHANGE_TIME, callback_data=f"tpltime:{template_id}"),
     ])
     rows.append([InlineKeyboardButton(text=texts.BTN_DELETE_ANIME, callback_data=f"anime_del:{template_id}")])
     rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data="anime_list")])
@@ -627,6 +650,33 @@ async def _create_template_and_show(
     )
 
 
+@router.callback_query(TplFSM.firstdate, F.data.startswith("tplmon:"))
+async def tpl_firstdate_month(callback: CallbackQuery, state: FSMContext):
+    month = int(callback.data.split(":")[1])
+    await state.update_data(fd_month=month)
+    data = await state.get_data()
+    await _edit_cb(callback, _firstdate_prompt(data), _firstdate_kb(month))
+    await callback.answer()
+
+
+def _parse_firstdate(raw: str, fd_month: int | None) -> date | str:
+    """День числом (рік поточний, місяць — обраний кнопкою) або повна дата
+    РРРР-ММ-ДД. Повертає date чи текст помилки."""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return texts.ERR_BAD_DATE
+    if raw.isdigit():
+        if fd_month is None:
+            return texts.ERR_NEED_MONTH
+        try:
+            return date(datetime.now(_KYIV).year, fd_month, int(raw))
+        except ValueError:
+            return texts.ERR_BAD_DAY
+    return texts.ERR_BAD_DAY if fd_month else texts.ERR_NEED_MONTH
+
+
 @router.message(TplFSM.firstdate)
 async def tpl_firstdate(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
@@ -634,11 +684,11 @@ async def tpl_firstdate(message: Message, state: FSMContext):
     data = await state.get_data()
     wd = data["weekday"]
     wd_name = texts.WEEKDAYS_FULL[wd].lower()
-    try:
-        d = date.fromisoformat(raw)
-    except ValueError:
+    fd_month = data.get("fd_month")
+    d = _parse_firstdate(raw, fd_month)
+    if isinstance(d, str):
         await _edit_panel(
-            message.bot, data, f"{texts.ERR_BAD_DATE}\n\n{_firstdate_prompt(data)}", _firstdate_kb()
+            message.bot, data, f"{d}\n\n{_firstdate_prompt(data)}", _firstdate_kb(fd_month)
         )
         return
     if d.weekday() != wd:
@@ -646,7 +696,7 @@ async def tpl_firstdate(message: Message, state: FSMContext):
             message.bot, data,
             f"{texts.ERR_DATE_WEEKDAY.format(date=d.isoformat(), weekday=wd_name)}\n\n"
             f"{_firstdate_prompt(data)}",
-            _firstdate_kb(),
+            _firstdate_kb(fd_month),
         )
         return
     start_date = d.isoformat()
@@ -1063,6 +1113,64 @@ async def cb_import_confirm(callback: CallbackQuery, state: FSMContext):
     await _edit_cb(callback, text, kb)
     await callback.answer(texts.IMPORT_DONE_TOAST.format(count=created))
     logger.info("Імпортовано %d серій у аніме #%s (слоти %s)", created, tid, slots)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   Зміна часу публікації
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data.startswith("tpltime:"))
+async def cb_edit_time(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    tpl = await get_template(tid)
+    if not tpl:
+        text, kb = await _anime_list_view()
+        await _edit_cb(callback, text, kb)
+        await callback.answer()
+        return
+    await state.clear()
+    await state.set_state(EditTimeFSM.time)
+    await state.update_data(
+        panel_chat=callback.message.chat.id, panel_msg=callback.message.message_id,
+        template_id=tid,
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anime:{tid}")],
+    ])
+    await _edit_cb(
+        callback,
+        texts.EDIT_TIME_PROMPT.format(name=html.escape(tpl["name"]), time=tpl["send_time"]),
+        kb,
+    )
+    await callback.answer()
+
+
+@router.message(EditTimeFSM.time)
+async def edit_time_input(message: Message, state: FSMContext):
+    hhmm = _parse_time(message.text or "")
+    await _delete(message)
+    data = await state.get_data()
+    tid = data["template_id"]
+    tpl = await get_template(tid)
+    if not tpl:
+        await state.clear()
+        return
+    if hhmm is None:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anime:{tid}")],
+        ])
+        await _edit_panel(
+            message.bot, data,
+            f"{texts.ERR_BAD_TIME}\n\n"
+            + texts.EDIT_TIME_PROMPT.format(name=html.escape(tpl["name"]), time=tpl["send_time"]),
+            kb,
+        )
+        return
+    moved = await set_send_time(tid, hhmm)
+    await state.clear()
+    text, kb = await _template_view(tid)
+    await _edit_panel(message.bot, data, text, kb)
+    logger.info("Аніме #%d: час публікації змінено на %s (перенесено %d випусків)", tid, hhmm, moved)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -196,6 +196,25 @@ async def get_template(template_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+async def set_send_time(template_id: int, send_time: str) -> int:
+    """Змінює час публікації аніме й переносить на новий час усі ще не
+    опубліковані (pending) випуски. Повертає к-сть перенесених випусків.
+    run_at має формат 'YYYY-MM-DD HH:MM' — дата лишається, час замінюється."""
+    await _conn().execute(
+        "UPDATE templates SET send_time = ? WHERE id = ?",
+        (send_time, template_id),
+    )
+    cur = await _conn().execute(
+        """
+        UPDATE releases SET run_at = substr(run_at, 1, 10) || ' ' || ?
+        WHERE template_id = ? AND status = 'pending'
+        """,
+        (send_time, template_id),
+    )
+    await _conn().commit()
+    return cur.rowcount
+
+
 async def set_repost_channel(template_id: int, channel: str | None) -> None:
     """Партнерський канал для репосту MP4 (NULL — вимкнути, пряма публікація)."""
     await _conn().execute(
