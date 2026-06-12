@@ -198,8 +198,36 @@ def _main_menu() -> tuple[str, InlineKeyboardMarkup]:
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=texts.BTN_NEW_ANIME, callback_data="anime_new")],
         [InlineKeyboardButton(text=texts.BTN_MY_ANIME, callback_data="anime_list")],
+        [InlineKeyboardButton(text=texts.BTN_CALENDAR, callback_data="schedule")],
     ])
     return texts.START_WELCOME, kb
+
+
+async def _schedule_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Розклад виходу: день тижня → аніме (час — назва), сьогодні підсвічено."""
+    tpls = await list_templates()
+    by_wd: dict[int, list[tuple[str, str]]] = {}
+    for t in tpls:
+        by_wd.setdefault(t["weekday"], []).append((t["send_time"], t["name"]))
+
+    today_wd = datetime.now(_KYIV).weekday()
+    lines = [texts.SCHEDULE_HEADER]
+    if not by_wd:
+        lines.append("")
+        lines.append(texts.SCHEDULE_EMPTY)
+    for wd in sorted(by_wd):
+        lines.append("")
+        lines.append(texts.SCHEDULE_DAY.format(
+            day=texts.WEEKDAYS_FULL[wd],
+            today=texts.SCHEDULE_TODAY_MARK if wd == today_wd else "",
+        ))
+        for send_time, name in sorted(by_wd[wd]):
+            lines.append(texts.SCHEDULE_ITEM.format(time=send_time, name=html.escape(name)))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=texts.BTN_BACK, callback_data="menu")],
+    ])
+    return "\n".join(lines), kb
 
 
 async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -493,6 +521,14 @@ async def cb_anime_page(callback: CallbackQuery, state: FSMContext):
     text, kb = await _template_view(int(tid_s), int(pg_s))
     if text is None:
         text, kb = await _anime_list_view()
+    await _edit_cb(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "schedule")
+async def cb_schedule(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, kb = await _schedule_view()
     await _edit_cb(callback, text, kb)
     await callback.answer()
 
