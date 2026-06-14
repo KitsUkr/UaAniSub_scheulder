@@ -76,6 +76,11 @@ def _done_episodes(tpl: dict, filled: set[int]) -> set[int]:
     return filled | manual_set
 
 
+def _published_episodes(tpl: dict, statuses: dict[int, str]) -> set[int]:
+    sent = {ep for ep, st in statuses.items() if st == "sent"}
+    return _done_episodes(tpl, sent)
+
+
 def _is_manual(tpl: dict, ep: int) -> bool:
     """Чи входить серія в перші manual_done (викладена вручну, без релізу)."""
     first = _first_ep(tpl)
@@ -235,10 +240,10 @@ async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
     all_statuses = await episode_statuses_all()
     rows: list[list[InlineKeyboardButton]] = []
     for t in tpls:
-        done = len(_done_episodes(t, set(all_statuses.get(t["id"], {}))))
+        published = len(_published_episodes(t, all_statuses.get(t["id"], {})))
         total = t["episodes_count"] - _first_ep(t) + 1
         rows.append([InlineKeyboardButton(
-            text=texts.ANIME_BTN.format(name=t["name"], filled=done, count=total),
+            text=texts.ANIME_BTN.format(name=t["name"], filled=published, count=total),
             callback_data=f"anime:{t['id']}",
         )])
     rows.append([InlineKeyboardButton(text=texts.BTN_NEW_ANIME, callback_data="anime_new")])
@@ -269,6 +274,7 @@ async def _template_view(
     pages = max(1, (total_slots + PER_PAGE - 1) // PER_PAGE)
     statuses = await episode_statuses(template_id)
     done = _done_episodes(tpl, set(statuses))
+    published = _published_episodes(tpl, statuses)
     # page=None → автоматично відкриваємо сторінку з першим незаповненим слотом.
     if page is None:
         page = _first_unfilled_page(tpl, done)
@@ -283,7 +289,7 @@ async def _template_view(
         count=total_slots,
         weekday=texts.WEEKDAYS_FULL[wd],
         time=tpl["send_time"],
-        filled=len(done),
+        filled=len(published),
     )
     d1 = _slot_date(tpl, start_ep)
     d2 = _slot_date(tpl, end_ep)
