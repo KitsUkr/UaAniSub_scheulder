@@ -49,7 +49,7 @@ START_WELCOME = (
 ANIME_LIST_HEADER = "📺 <b>Мої аніме</b>:"
 ANIME_LIST_EMPTY = "Поки що немає жодного аніме. Створи перше 👇"
 # {name} {filled} {count}
-ANIME_BTN = "📺 {name} ({filled}/{count})"
+ANIME_BTN = "{name} ({filled}/{count})"
 
 # ── Майстер створення аніме ───────────────────────────────────────────────────
 TPL_ASK_ZERO = (

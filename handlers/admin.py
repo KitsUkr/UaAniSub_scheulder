@@ -247,8 +247,18 @@ async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
     return header, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _first_unfilled_page(tpl: dict, done: set[int]) -> int:
+    """Сторінка з першою ще не заповненою серією (⬜ — без релізу й не вручну).
+    Якщо всі серії заповнені — повертає 0 (лишаємось на першій сторінці)."""
+    first = _first_ep(tpl)
+    for ep in range(first, tpl["episodes_count"] + 1):
+        if ep not in done:
+            return _page_of(ep, first)
+    return 0
+
+
 async def _template_view(
-    template_id: int, page: int = 0
+    template_id: int, page: int | None = 0
 ) -> tuple[str | None, InlineKeyboardMarkup | None]:
     tpl = await get_template(template_id)
     if not tpl:
@@ -257,9 +267,12 @@ async def _template_view(
     last = tpl["episodes_count"]
     total_slots = last - first + 1
     pages = max(1, (total_slots + PER_PAGE - 1) // PER_PAGE)
-    page = max(0, min(page, pages - 1))
     statuses = await episode_statuses(template_id)
     done = _done_episodes(tpl, set(statuses))
+    # page=None → автоматично відкриваємо сторінку з першим незаповненим слотом.
+    if page is None:
+        page = _first_unfilled_page(tpl, done)
+    page = max(0, min(page, pages - 1))
     wd = tpl["weekday"]
 
     start_ep = first + page * PER_PAGE
@@ -507,7 +520,8 @@ async def cb_anime_list(callback: CallbackQuery, state: FSMContext):
 async def cb_anime(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     tid = int(callback.data.split(":")[1])
-    text, kb = await _template_view(tid)
+    # page=None → відкриваємо сторінку з першою незаповненою серією.
+    text, kb = await _template_view(tid, page=None)
     if text is None:
         text, kb = await _anime_list_view()
     await _edit_cb(callback, text, kb)
