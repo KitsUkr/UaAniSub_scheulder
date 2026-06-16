@@ -203,23 +203,17 @@ def _main_menu() -> tuple[str, InlineKeyboardMarkup]:
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=texts.BTN_NEW_ANIME, callback_data="anime_new")],
         [InlineKeyboardButton(text=texts.BTN_MY_ANIME, callback_data="anime_list")],
-        [InlineKeyboardButton(text=texts.BTN_CALENDAR, callback_data="schedule")],
     ])
     return texts.START_WELCOME, kb
 
 
-async def _schedule_view() -> tuple[str, InlineKeyboardMarkup]:
-    """Розклад виходу: день тижня → аніме (час — назва), сьогодні підсвічено."""
-    tpls = await list_templates()
+def _schedule_lines(tpls: list[dict]) -> list[str]:
     by_wd: dict[int, list[tuple[str, str]]] = {}
     for t in tpls:
         by_wd.setdefault(t["weekday"], []).append((t["send_time"], t["name"]))
 
     today_wd = datetime.now(_KYIV).weekday()
-    lines = [texts.SCHEDULE_HEADER]
-    if not by_wd:
-        lines.append("")
-        lines.append(texts.SCHEDULE_EMPTY)
+    lines: list[str] = []
     for wd in sorted(by_wd):
         lines.append("")
         lines.append(texts.SCHEDULE_DAY.format(
@@ -228,11 +222,7 @@ async def _schedule_view() -> tuple[str, InlineKeyboardMarkup]:
         ))
         for send_time, name in sorted(by_wd[wd]):
             lines.append(texts.SCHEDULE_ITEM.format(time=send_time, name=html.escape(name)))
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=texts.BTN_BACK, callback_data="menu")],
-    ])
-    return "\n".join(lines), kb
+    return lines
 
 
 async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -248,13 +238,15 @@ async def _anime_list_view() -> tuple[str, InlineKeyboardMarkup]:
         )])
     rows.append([InlineKeyboardButton(text=texts.BTN_NEW_ANIME, callback_data="anime_new")])
     rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data="menu")])
-    header = texts.ANIME_LIST_HEADER if tpls else texts.ANIME_LIST_EMPTY
-    return header, InlineKeyboardMarkup(inline_keyboard=rows)
+    # У списку аніме показуємо ще й розклад виходу (день тижня → аніме).
+    if tpls:
+        text = "\n".join([texts.ANIME_LIST_HEADER, *_schedule_lines(tpls)])
+    else:
+        text = texts.ANIME_LIST_EMPTY
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _first_unfilled_page(tpl: dict, done: set[int]) -> int:
-    """Сторінка з першою ще не заповненою серією (⬜ — без релізу й не вручну).
-    Якщо всі серії заповнені — повертає 0 (лишаємось на першій сторінці)."""
     first = _first_ep(tpl)
     for ep in range(first, tpl["episodes_count"] + 1):
         if ep not in done:
@@ -543,14 +535,6 @@ async def cb_anime_page(callback: CallbackQuery, state: FSMContext):
     text, kb = await _template_view(int(tid_s), int(pg_s))
     if text is None:
         text, kb = await _anime_list_view()
-    await _edit_cb(callback, text, kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "schedule")
-async def cb_schedule(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    text, kb = await _schedule_view()
     await _edit_cb(callback, text, kb)
     await callback.answer()
 
