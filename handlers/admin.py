@@ -321,9 +321,11 @@ async def _template_view(
     rows.append([
         InlineKeyboardButton(text=texts.BTN_IMPORT, callback_data=f"import:{template_id}"),
         InlineKeyboardButton(text=texts.BTN_REPOST, callback_data=f"repost:{template_id}"),
-        InlineKeyboardButton(text=texts.BTN_CHANGE_TIME, callback_data=f"tpltime:{template_id}"),
     ])
-    rows.append([InlineKeyboardButton(text=texts.BTN_DELETE_ANIME, callback_data=f"anime_del:{template_id}")])
+    rows.append([
+        InlineKeyboardButton(text=texts.BTN_CHANGE_TIME, callback_data=f"tpltime:{template_id}"),
+        InlineKeyboardButton(text=texts.BTN_DELETE_ANIME, callback_data=f"anime_del:{template_id}"),
+    ])
     rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data="anime_list")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
