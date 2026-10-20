@@ -7,3 +7,4 @@ __pycache__/
 data/
 releases.db-shm
 releases.db-wal
+make_session.py
