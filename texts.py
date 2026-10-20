@@ -38,6 +38,9 @@ BTN_IMPORT_RESET = "♻️ Скинути"
 BTN_REPOST = "📡 Репост з каналу"
 BTN_REPOST_OFF = "🚫 Вимкнути репост"
 BTN_CHANGE_TIME = "⏰ Час"
+BTN_MOON = "🌙 MoonAnime"
+BTN_MOON_OFF = "🚫 Вимкнути вивантаження"
+BTN_MOON_RETRY = "🔁 Повторити вивантаження"
 # ── Головне меню ──────────────────────────────────────────────────────────────
 START_WELCOME = (
     "Обери дію кнопкою нижче."
@@ -271,4 +274,46 @@ ALERT_PUBLISH_FAILED = (
     "🚨 Не вдалося опублікувати випуск #{id} (план: {run_at}).\n"
     "Помилка: <code>{error}</code>\n\n"
     "Перевір, що бот — адміністратор у каналах з правом постингу."
+)
+
+# ── MoonAnime (автовивантаження MP4 на плеєр) ─────────────────────────────────
+# {mal_id} {season}
+MOON_LINE = "🌙 MoonAnime: MAL <code>{mal_id}</code> · сезон з назви файлу (запасний — {season})"
+# {bot} {current}
+MOON_PROMPT = (
+    "🌙 <b>Вивантаження на MoonAnime</b>\n\n"
+    "Після публікації кожна серія (MP4) автоматично пересилається в {bot} — "
+    "звідти вона йде на плеєр MoonAnime.\n\n"
+    "Надішли <b>MAL ID</b> аніме: <code>16498</code> або посилання на MyAnimeList.\n\n"
+    "<b>Сезон</b> бот бере з назви файлу чи підпису MP4: <code>…_S02E05</code> → сезон 2. "
+    "Якщо мітки SxxEyy там немає — піде запасний сезон; його можна вказати через "
+    "пробіл: <code>16498 2</code> (за замовчуванням 1).\n\n"
+    "{current}"
+)
+# {mal_id} {season}
+MOON_CURRENT_ON = "Зараз: MAL <code>{mal_id}</code>, запасний сезон {season}"
+MOON_CURRENT_OFF = "Зараз: <i>вимкнено</i>"
+MOON_NOT_CONFIGURED = (
+    "⚠️ Юзербот не налаштований (MOON_API_ID / MOON_API_HASH / MOON_SESSION у .env) — "
+    "поки його нема, серії не вивантажуватимуться."
+)
+ERR_MOON_META = "❗ Не розпізнав. Приклад: <code>16498</code> або <code>16498 2</code>."
+MOON_OFF_TOAST = "🚫 Вивантаження вимкнено"
+MOON_RETRY_TOAST = "🔁 Поставлено в чергу"
+MOON_RETRY_STALE = "Уже в черзі або вивантажено"
+# {text}
+MOON_BOT_REPLY = "\nВідповідь бота:\n<blockquote>{text}</blockquote>"
+# {ep} {name} {reply}
+MOON_DONE = "🌙 Серія {ep} «{name}» відправлена на MoonAnime.{reply}"
+# {ep} {name} {reason} {reply} {bot}
+MOON_FAILED = (
+    "🌙❗ Не вдалося вивантажити серію {ep} «{name}» на MoonAnime.\n"
+    "Причина: {reason}\n{reply}\n\n"
+    "Довантаж вручну в {bot} або повтори спробу."
+)
+MOON_INTERRUPTED = "діалог перервав перезапуск бота — перевір у боті-завантажувачі, чи серія не пішла"
+# {error}
+MOON_START_FAILED = (
+    "🌙❗ Юзербот MoonAnime не запустився: <code>{error}</code>\n"
+    "Серії й далі ставляться в чергу — підуть після перезапуску з робочою сесією."
 )

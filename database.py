@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS templates (
     has_zero        INTEGER NOT NULL DEFAULT 0, -- чи є нульова серія (відлік з 0)
     first_day       INTEGER NOT NULL DEFAULT 1, -- скільки серій виходить у перший день
     repost_channel  TEXT,                       -- партнерський канал для репосту MP4 (NULL = пряма публікація)
+    mal_id          INTEGER,                    -- MyAnimeList ID для MoonAnime (NULL = не вивантажувати)
+    season          INTEGER,                    -- номер сезону для MoonAnime
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -61,7 +63,9 @@ CREATE TABLE IF NOT EXISTS releases (
     template_id     INTEGER REFERENCES templates(id) ON DELETE SET NULL,
     episode_no      INTEGER,
     created_at      TEXT DEFAULT (datetime('now')),
-    sent_at         TEXT
+    sent_at         TEXT,
+    moon_status     TEXT,                       -- MoonAnime: NULL / pending / uploading / done / failed
+    moon_error      TEXT                        -- причина останньої невдачі вивантаження
 );
 
 CREATE INDEX IF NOT EXISTS idx_releases_due
@@ -105,6 +109,8 @@ async def _migrate() -> None:
         ("mp4_caption_html", "TEXT"),
         ("mp4_msg_id", "INTEGER"),
         ("mkv_msg_id", "INTEGER"),
+        ("moon_status", "TEXT"),
+        ("moon_error", "TEXT"),
     ):
         if col not in cols:
             await _conn().execute(f"ALTER TABLE releases ADD COLUMN {col} {decl}")
@@ -125,6 +131,10 @@ async def _migrate() -> None:
         )
     if "repost_channel" not in tcols:
         await _conn().execute("ALTER TABLE templates ADD COLUMN repost_channel TEXT")
+    if "mal_id" not in tcols:
+        await _conn().execute("ALTER TABLE templates ADD COLUMN mal_id INTEGER")
+    if "season" not in tcols:
+        await _conn().execute("ALTER TABLE templates ADD COLUMN season INTEGER")
     # Індекс по слоту створюємо тут — після того, як колонки гарантовано є
     # (на старій БД їх ще не було під час executescript).
     await _conn().execute(
@@ -176,7 +186,8 @@ async def create_template(
 async def list_templates() -> list[dict]:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day, repost_channel
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day, repost_channel,
+               mal_id, season
         FROM templates
         ORDER BY created_at
         """,
@@ -187,7 +198,8 @@ async def list_templates() -> list[dict]:
 async def get_template(template_id: int) -> dict | None:
     cur = await _conn().execute(
         """
-        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day, repost_channel
+        SELECT id, name, weekday, send_time, episodes_count, start_date, manual_done, has_zero, first_day, repost_channel,
+               mal_id, season
         FROM templates WHERE id = ?
         """,
         (template_id,),
@@ -357,7 +369,7 @@ async def due_releases(now_str: str) -> list[dict]:
         SELECT r.id, r.preview_file_id, r.caption_html,
                r.mp4_file_id, r.mp4_kind, r.mp4_caption_html, r.mkv_file_id, r.mkv_kind, r.run_at,
                r.mp4_msg_id, r.mkv_msg_id,
-               t.repost_channel
+               t.repost_channel, t.mal_id
         FROM releases r LEFT JOIN templates t ON t.id = r.template_id
         WHERE r.status IN ('pending', 'sending') AND r.run_at <= ?
         ORDER BY r.run_at
@@ -427,6 +439,74 @@ async def cancel_release(release_id: int) -> bool:
     """Видаляє запланований (pending) випуск. True, якщо щось видалили."""
     cur = await _conn().execute(
         "DELETE FROM releases WHERE id = ? AND status = 'pending'",
+        (release_id,),
+    )
+    await _conn().commit()
+    return cur.rowcount > 0
+
+
+# ── Вивантаження на MoonAnime ─────────────────────────────────────────────────
+
+async def set_moon_meta(template_id: int, mal_id: int | None, season: int | None) -> None:
+    """MAL ID і сезон для MoonAnime (NULL — вивантаження вимкнене)."""
+    await _conn().execute(
+        "UPDATE templates SET mal_id = ?, season = ? WHERE id = ?",
+        (mal_id, season, template_id),
+    )
+    await _conn().commit()
+
+
+async def queue_moon_upload(release_id: int) -> None:
+    """Ставить щойно опублікований випуск у чергу на MoonAnime — лише раз:
+    уже вивантажений чи провалений не чіпаємо."""
+    await _conn().execute(
+        "UPDATE releases SET moon_status = 'pending', moon_error = NULL "
+        "WHERE id = ? AND moon_status IS NULL",
+        (release_id,),
+    )
+    await _conn().commit()
+
+
+_MOON_JOBS_SQL = """
+    SELECT r.id, r.episode_no, r.mp4_msg_id, t.name, t.mal_id, t.season
+    FROM releases r LEFT JOIN templates t ON t.id = r.template_id
+    WHERE r.moon_status = ?
+    ORDER BY r.id
+"""
+
+
+async def pending_moon_uploads() -> list[dict]:
+    cur = await _conn().execute(_MOON_JOBS_SQL, ("pending",))
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def set_moon_status(release_id: int, status: str, error: str | None = None) -> None:
+    await _conn().execute(
+        "UPDATE releases SET moon_status = ?, moon_error = ? WHERE id = ?",
+        (status, error, release_id),
+    )
+    await _conn().commit()
+
+
+async def fail_interrupted_moon_uploads(error: str) -> list[dict]:
+    """Випуски, на яких бот упав посеред діалогу (uploading) → failed.
+    Повторювати наосліп не можна: пачка могла вже піти на MoonAnime."""
+    cur = await _conn().execute(_MOON_JOBS_SQL, ("uploading",))
+    rows = [dict(r) for r in await cur.fetchall()]
+    if rows:
+        await _conn().execute(
+            "UPDATE releases SET moon_status = 'failed', moon_error = ? WHERE moon_status = 'uploading'",
+            (error,),
+        )
+        await _conn().commit()
+    return rows
+
+
+async def retry_moon_upload(release_id: int) -> bool:
+    """Повертає провалене вивантаження в чергу. True, якщо було що повертати."""
+    cur = await _conn().execute(
+        "UPDATE releases SET moon_status = 'pending', moon_error = NULL "
+        "WHERE id = ? AND moon_status = 'failed'",
         (release_id,),
     )
     await _conn().commit()

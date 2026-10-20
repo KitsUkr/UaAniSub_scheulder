@@ -16,6 +16,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import moon
 import texts
 from caption import render_caption
 from config import ADMIN_IDS, PREVIEW_CHANNEL, RELEASE_CHANNEL, TZ
@@ -24,6 +25,7 @@ from database import (
     mark_failed,
     mark_sending,
     mark_sent,
+    queue_moon_upload,
     save_mkv_msg_id,
     save_mp4_msg_id,
 )
@@ -154,6 +156,12 @@ async def _publish_due(bot: Bot) -> None:
             await mark_failed(r["id"])
             logger.exception("Не вдалося опублікувати випуск #%d: %s", r["id"], exc)
             await _alert_admins(bot, r, exc)
+        else:
+            # MP4 уже в release-каналі — окремий воркер перешле його на плеєр
+            # MoonAnime, не затримуючи публікацію інших випусків.
+            if r.get("mal_id") and moon.enabled():
+                await queue_moon_upload(r["id"])
+                moon.kick()
         await asyncio.sleep(0.05)  # делікатно щодо лімітів Telegram
 
 

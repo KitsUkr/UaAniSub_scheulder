@@ -2,4 +2,6 @@ aiogram>=3.25,<4
 APScheduler>=3.10,<4
 aiosqlite>=0.20
 python-dotenv>=1.0
+telethon>=1.36,<2
+qrcode>=7.4  # лише для make_session.py: QR-вхід юзербота
 tzdata

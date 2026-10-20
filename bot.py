@@ -6,6 +6,7 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
+import moon
 import scheduler as scheduler_module
 from config import BOT_TOKEN
 from database import close_db, init_db
@@ -45,6 +46,7 @@ async def main():
     dp.include_router(admin.router)
 
     sched = scheduler_module.start(bot)
+    await moon.start(bot)
 
     logger.info("Бот запущено! Очікування повідомлень...")
     try:
@@ -54,6 +56,7 @@ async def main():
         )
     finally:
         scheduler_module.stop(sched)
+        await moon.stop()
         await bot.session.close()
         await close_db()
 

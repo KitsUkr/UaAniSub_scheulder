@@ -19,8 +19,9 @@ from aiogram.types import (
     Message,
 )
 
+import moon
 import texts
-from config import ADMIN_IDS, TZ
+from config import ADMIN_IDS, MOON_BOT, TZ
 from database import (
     cancel_release,
     create_release,
@@ -32,7 +33,9 @@ from database import (
     get_release_by_slot,
     get_template,
     list_templates,
+    retry_moon_upload,
     retry_release,
+    set_moon_meta,
     set_repost_channel,
     set_send_time,
 )
@@ -124,6 +127,10 @@ class RepostFSM(StatesGroup):
 
 class EditTimeFSM(StatesGroup):
     time = State()  # очікуємо новий час публікації ГГ:ХХ
+
+
+class MoonFSM(StatesGroup):
+    meta = State()  # очікуємо «MAL_ID [сезон]» для вивантаження на MoonAnime
 
 
 # ── Клавіатури ────────────────────────────────────────────────────────────────
@@ -283,6 +290,8 @@ async def _template_view(
         time=tpl["send_time"],
         filled=len(published),
     )
+    if tpl.get("mal_id"):
+        text += "\n" + texts.MOON_LINE.format(mal_id=tpl["mal_id"], season=tpl.get("season") or 1)
     d1 = _slot_date(tpl, start_ep)
     d2 = _slot_date(tpl, end_ep)
     text += "\n\n" + texts.SLOT_RANGE.format(
@@ -314,6 +323,7 @@ async def _template_view(
         InlineKeyboardButton(text=texts.BTN_IMPORT, callback_data=f"import:{template_id}"),
         InlineKeyboardButton(text=texts.BTN_REPOST, callback_data=f"repost:{template_id}"),
     ])
+    rows.append([InlineKeyboardButton(text=texts.BTN_MOON, callback_data=f"moon:{template_id}")])
     rows.append([
         InlineKeyboardButton(text=texts.BTN_CHANGE_TIME, callback_data=f"tpltime:{template_id}"),
         InlineKeyboardButton(text=texts.BTN_DELETE_ANIME, callback_data=f"anime_del:{template_id}"),
@@ -1309,3 +1319,117 @@ async def cb_repost_off(callback: CallbackQuery, state: FSMContext):
         text, kb = await _anime_list_view()
     await _edit_cb(callback, text, kb)
     await callback.answer(texts.REPOST_OFF_TOAST)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   Вивантаження на MoonAnime
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MAL_URL_RE = re.compile(r"myanimelist\.net/anime/(\d+)", re.IGNORECASE)
+
+
+def _parse_moon_meta(raw: str) -> tuple[int, int] | None:
+    """«16498», «16498 2» або посилання на MyAnimeList (+ сезон) → (mal_id, season)."""
+    parts = (raw or "").split()
+    if not 1 <= len(parts) <= 2:
+        return None
+    url = _MAL_URL_RE.search(parts[0])
+    mal = url.group(1) if url else parts[0]
+    season = parts[1] if len(parts) == 2 else "1"
+    if not (re.fullmatch(r"[0-9]{1,7}", mal) and re.fullmatch(r"[0-9]{1,2}", season)):
+        return None
+    if int(mal) == 0 or int(season) == 0:
+        return None
+    return int(mal), int(season)
+
+
+def _moon_prompt(tpl: dict) -> str:
+    current = (
+        texts.MOON_CURRENT_ON.format(mal_id=tpl["mal_id"], season=tpl.get("season") or 1)
+        if tpl.get("mal_id") else texts.MOON_CURRENT_OFF
+    )
+    text = texts.MOON_PROMPT.format(bot=html.escape(MOON_BOT), current=current)
+    if not moon.enabled():
+        text += "\n\n" + texts.MOON_NOT_CONFIGURED
+    return text
+
+
+def _moon_kb(template_id: int, has_meta: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_meta:
+        rows.append([InlineKeyboardButton(
+            text=texts.BTN_MOON_OFF, callback_data=f"moon_off:{template_id}",
+        )])
+    rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data=f"anime:{template_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("moon:"))
+async def cb_moon_start(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    tpl = await get_template(tid)
+    if not tpl:
+        text, kb = await _anime_list_view()
+        await _edit_cb(callback, text, kb)
+        await callback.answer()
+        return
+    await state.clear()
+    await state.set_state(MoonFSM.meta)
+    await state.update_data(
+        panel_chat=callback.message.chat.id, panel_msg=callback.message.message_id,
+        template_id=tid,
+    )
+    await _edit_cb(callback, _moon_prompt(tpl), _moon_kb(tid, bool(tpl.get("mal_id"))))
+    await callback.answer()
+
+
+@router.message(MoonFSM.meta)
+async def moon_meta_input(message: Message, state: FSMContext):
+    meta = _parse_moon_meta(message.text or "")
+    await _delete(message)
+    data = await state.get_data()
+    tid = data["template_id"]
+    tpl = await get_template(tid)
+    if not tpl:
+        await state.clear()
+        return
+    if meta is None:
+        await _edit_panel(
+            message.bot, data,
+            texts.ERR_MOON_META + "\n\n" + _moon_prompt(tpl),
+            _moon_kb(tid, bool(tpl.get("mal_id"))),
+        )
+        return
+    mal_id, season = meta
+    await set_moon_meta(tid, mal_id, season)
+    await state.clear()
+    text, kb = await _template_view(tid)
+    await _edit_panel(message.bot, data, text, kb)
+    logger.info("Аніме #%d: MoonAnime MAL %d, сезон %d", tid, mal_id, season)
+
+
+@router.callback_query(F.data.startswith("moon_off:"))
+async def cb_moon_off(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    await set_moon_meta(tid, None, None)
+    await state.clear()
+    text, kb = await _template_view(tid)
+    if text is None:
+        text, kb = await _anime_list_view()
+    await _edit_cb(callback, text, kb)
+    await callback.answer(texts.MOON_OFF_TOAST)
+
+
+@router.callback_query(F.data.startswith("moonretry:"))
+async def cb_moon_retry(callback: CallbackQuery):
+    """Кнопка під алертом про невдале вивантаження: failed → знову в черзі."""
+    rid = int(callback.data.split(":")[1])
+    retried = await retry_moon_upload(rid)
+    if retried:
+        moon.kick()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        logger.info("Випуск #%d повернуто в чергу вивантаження на MoonAnime", rid)
+    await callback.answer(texts.MOON_RETRY_TOAST if retried else texts.MOON_RETRY_STALE)
