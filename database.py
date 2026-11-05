@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS releases (
     status          TEXT NOT NULL DEFAULT 'pending',
     mp4_msg_id      INTEGER,                    -- id поста MP4 у release-каналі (вже відправлено)
     mkv_msg_id      INTEGER,                    -- id поста MKV у release-каналі (вже відправлено)
-    -- При видаленні шаблону опубліковані релізи лишаються в історії без привʼязки.
+    -- Шаблон видаляється разом із усіма релізами (delete_template чистить їх
+    -- вручну, бо старі БД створені без цього FK).
     template_id     INTEGER REFERENCES templates(id) ON DELETE SET NULL,
     episode_no      INTEGER,
     created_at      TEXT DEFAULT (datetime('now')),
@@ -139,6 +140,17 @@ async def _migrate() -> None:
     # (на старій БД їх ще не було під час executescript).
     await _conn().execute(
         "CREATE INDEX IF NOT EXISTS idx_releases_slot ON releases (template_id, episode_no)"
+    )
+    # Разове зцілення: видаляємо релізи-сироти, чий template_id вказує на
+    # вже видалений шаблон. У БД без FK такі «висячі» релізи після
+    # перевикористання id шаблону підтягувалися в нове аніме (чужі ✅/підписи),
+    # а pending-сироти планувальник опублікував би без жодного шаблону.
+    await _conn().execute(
+        """
+        DELETE FROM releases
+        WHERE template_id IS NOT NULL
+          AND template_id NOT IN (SELECT id FROM templates)
+        """
     )
     await _conn().commit()
 
@@ -237,10 +249,11 @@ async def set_repost_channel(template_id: int, channel: str | None) -> None:
 
 
 async def delete_template(template_id: int) -> bool:
-    """Видаляє шаблон і його ще не опубліковані (pending) релізи.
-    Опубліковані релізи лишаються в історії. True, якщо шаблон існував."""
+    """Видаляє шаблон і ВСІ його релізи (заплановані й опубліковані) —
+    аніме зникає з БД повністю. Пости в каналах лишаються, їх Telegram
+    не дає прибрати звідси. True, якщо шаблон існував."""
     await _conn().execute(
-        "DELETE FROM releases WHERE template_id = ? AND status = 'pending'",
+        "DELETE FROM releases WHERE template_id = ?",
         (template_id,),
     )
     cur = await _conn().execute("DELETE FROM templates WHERE id = ?", (template_id,))
